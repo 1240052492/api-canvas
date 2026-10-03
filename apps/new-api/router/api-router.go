@@ -394,5 +394,15 @@ func SetApiRouter(router *gin.Engine) {
 			deploymentsRoute.POST("/:id/extend", controller.ExtendDeployment)
 			deploymentsRoute.DELETE("/:id", controller.DeleteDeployment)
 		}
+
+		// Internal v1 API (service-to-service communication)
+		internal := apiRouter.Group("/internal/v1")
+		internal.Use(middleware.InternalTokenAuth())
+		{
+			walletRoute := internal.Group("/wallet")
+			{
+				walletRoute.POST("/pre-deduct", controller.PreDeductCredits)
+			}
+		}
 	}
 }
