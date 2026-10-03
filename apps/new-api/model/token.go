@@ -29,6 +29,7 @@ type Token struct {
 	Group              string         `json:"group" gorm:"default:''"`
 	CrossGroupRetry    bool           `json:"cross_group_retry"`                                 // 跨分组重试，仅auto分组有效
 	DisplayRatio       float64        `json:"display_ratio" gorm:"type:decimal(10,4);default:1"` // 对外展示系数：仅影响显示价格，不影响真实扣减
+	ServiceName        *string        `json:"service_name" gorm:"column:service_name;type:varchar(64)"`
 	DeletedAt          gorm.DeletedAt `gorm:"index"`
 }
 

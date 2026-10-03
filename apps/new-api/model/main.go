@@ -239,6 +239,9 @@ func migrateDB() error {
 	if err := migrateTokenModelLimitsToText(); err != nil {
 		return err
 	}
+	if err := MigrateServiceNameColumn(); err != nil {
+		return fmt.Errorf("migrate service_name column: %w", err)
+	}
 	migrateQuotaForNewUserDefault()
 	if err := prepareSQLiteMigrations(); err != nil {
 		return err
