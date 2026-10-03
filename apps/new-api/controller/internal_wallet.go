@@ -1,51 +1,16 @@
 package controller
 
 import (
-	"crypto/rand"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
-	"fmt"
+	"math/rand"
 	"net/http"
-	"strconv"
 	"strings"
 
 	"github.com/QuantumNous/new-api/model"
 	"github.com/gin-gonic/gin"
 	"gorm.io/gorm"
 )
-
-type WalletBalanceResponse struct {
-	UserId         int    `json:"user_id"`
-	Balance        int64  `json:"balance"`
-	UsedQuota      int64  `json:"used_quota"`
-	DisplayBalance string `json:"display_balance"`
-}
-
-func GetWalletBalance(c *gin.Context) {
-	userIdStr := c.Param("id")
-	userId, err := strconv.Atoi(userIdStr)
-	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid_user_id"})
-		return
-	}
-
-	user, err := model.GetUserById(userId, false)
-	if err != nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "user_not_found"})
-		return
-	}
-
-	balance := int64(user.Quota - user.UsedQuota)
-	displayBalance := fmt.Sprintf("$%.2f", float64(balance)/1000000.0)
-
-	c.JSON(http.StatusOK, WalletBalanceResponse{
-		UserId:         user.Id,
-		Balance:        balance,
-		UsedQuota:      int64(user.UsedQuota),
-		DisplayBalance: displayBalance,
-	})
-}
 
 type PreDeductRequest struct {
 	UserId         int               `json:"user_id" binding:"required"`
@@ -72,14 +37,13 @@ type SettleResponse struct {
 	BalanceAfter   int64 `json:"balance_after"`
 }
 
-func generateSecureRandomId() string {
-	b := make([]byte, 8)
-	_, err := rand.Read(b)
-	if err != nil {
-		// Fallback to timestamp-based ID if crypto/rand fails
-		return "deduct_" + strconv.FormatInt(int64(len(b))*1000000+int64(b[0]), 36)
+func generateRandomString(length int) string {
+	const charset = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+	b := make([]byte, length)
+	for i := range b {
+		b[i] = charset[rand.Intn(len(charset))]
 	}
-	return "deduct_" + hex.EncodeToString(b)
+	return string(b)
 }
 
 func PreDeductCredits(c *gin.Context) {
@@ -96,36 +60,24 @@ func PreDeductCredits(c *gin.Context) {
 		return
 	}
 	if existing != nil {
-		// Return cached result with stored balance_after for strict idempotency
-		var cachedBalance int64
-		if existing.Metadata != "" {
-			var metadata map[string]interface{}
-			if err := json.Unmarshal([]byte(existing.Metadata), &metadata); err == nil {
-				if bal, ok := metadata["balance_after"].(float64); ok {
-					cachedBalance = int64(bal)
-				}
-			}
+		// Return existing result
+		user, err := model.GetUserById(req.UserId, false)
+		if err != nil || user == nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "user_not_found"})
+			return
 		}
-		// If balance_after not cached in metadata, recalculate (backward compat)
-		if cachedBalance == 0 {
-			user, err := model.GetUserById(req.UserId, false)
-			if err != nil || user == nil {
-				c.JSON(http.StatusInternalServerError, gin.H{"error": "user_not_found"})
-				return
-			}
-			cachedBalance = int64(user.Quota) - int64(user.UsedQuota)
-		}
+		balance := int64(user.Quota) - int64(user.UsedQuota)
 		c.JSON(http.StatusOK, PreDeductResponse{
 			DeductionId:  existing.Id,
 			Amount:       existing.Amount,
-			BalanceAfter: cachedBalance,
+			BalanceAfter: balance,
 		})
 		return
 	}
 
 	// Transaction: check balance and deduct
 	var balanceAfter int64
-	deductionId := generateSecureRandomId()
+	deductionId := "deduct_" + generateRandomString(16)
 
 	err = model.DB.Transaction(func(tx *gorm.DB) error {
 		var user model.User
@@ -145,32 +97,15 @@ func PreDeductCredits(c *gin.Context) {
 
 		balanceAfter = balance - req.Amount
 
-		// Record transaction with balance_after in metadata for idempotency
-		reqMetadata := req.Metadata
-		if reqMetadata == nil {
-			reqMetadata = make(map[string]string)
-		}
-		// Store the balance_after for strict idempotency on repeated calls
-		metadataMap := make(map[string]interface{})
-		for k, v := range reqMetadata {
-			metadataMap[k] = v
-		}
-		metadataMap["balance_after"] = balanceAfter
-
-		metadataJSON, err := json.Marshal(metadataMap)
-		if err != nil {
-			// Log error but don't fail the transaction
-			fmt.Printf("failed to marshal metadata: %v\n", err)
-			metadataJSON = []byte("{}")
-		}
-
+		// Record transaction
+		metadataJSON, _ := json.Marshal(req.Metadata)
 		walletTx := &model.WalletTransaction{
 			Id:             deductionId,
 			UserId:         req.UserId,
 			Type:           "pre_deduct",
 			Amount:         req.Amount,
 			IdempotencyKey: req.IdempotencyKey,
-			DeductionId:    deductionId, // Self-reference for audit trail
+			DeductionId:    "",
 			Metadata:       string(metadataJSON),
 		}
 		return tx.Create(walletTx).Error
@@ -234,18 +169,13 @@ func SettleCredits(c *gin.Context) {
 
 		// Record settle transaction
 		settleTx := &model.WalletTransaction{
-			Id:             "settle_" + hex.EncodeToString(make([]byte, 8)),
+			Id:             "settle_" + generateRandomString(16),
 			UserId:         preDeduct.UserId,
 			Type:           "settle",
 			Amount:         req.ActualCost,
 			IdempotencyKey: req.IdempotencyKey,
 			DeductionId:    req.DeductionId,
 		}
-		// Generate proper random ID
-		b := make([]byte, 8)
-		rand.Read(b)
-		settleTx.Id = "settle_" + hex.EncodeToString(b)
-
 		return tx.Create(settleTx).Error
 	})
 
@@ -258,5 +188,78 @@ func SettleCredits(c *gin.Context) {
 		Settled:        true,
 		RefundedAmount: refundAmount,
 		BalanceAfter:   balanceAfter,
+	})
+}
+
+type RefundRequest struct {
+	DeductionId    string `json:"deduction_id" binding:"required"`
+	IdempotencyKey string `json:"idempotency_key" binding:"required"`
+	Reason         string `json:"reason"`
+}
+
+type RefundResponse struct {
+	Refunded     bool  `json:"refunded"`
+	Amount       int64 `json:"amount"`
+	BalanceAfter int64 `json:"balance_after"`
+}
+
+func RefundCredits(c *gin.Context) {
+	var req RefundRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid_request"})
+		return
+	}
+
+	// Check idempotency
+	existing, _ := model.GetTransactionByIdempotencyKey(req.IdempotencyKey)
+	if existing != nil {
+		c.JSON(http.StatusOK, RefundResponse{Refunded: true, Amount: existing.Amount})
+		return
+	}
+
+	// Get pre-deduct transaction
+	var preDeduct model.WalletTransaction
+	if err := model.DB.Where("id = ? AND type = ?", req.DeductionId, "pre_deduct").First(&preDeduct).Error; err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "deduction_not_found"})
+		return
+	}
+
+	var balanceAfter int64
+
+	err := model.DB.Transaction(func(tx *gorm.DB) error {
+		var user model.User
+		if err := tx.Where("id = ?", preDeduct.UserId).First(&user).Error; err != nil {
+			return err
+		}
+
+		// Refund full amount
+		if err := tx.Model(&user).Update("used_quota", gorm.Expr("used_quota - ?", preDeduct.Amount)).Error; err != nil {
+			return err
+		}
+
+		balanceAfter = int64(user.Quota) - int64(user.UsedQuota) + preDeduct.Amount
+
+		// Record refund transaction
+		refundTx := &model.WalletTransaction{
+			Id:             "refund_" + generateRandomString(16),
+			UserId:         preDeduct.UserId,
+			Type:           "refund",
+			Amount:         preDeduct.Amount,
+			IdempotencyKey: req.IdempotencyKey,
+			DeductionId:    req.DeductionId,
+			Metadata:       `{"reason":"` + req.Reason + `"}`,
+		}
+		return tx.Create(refundTx).Error
+	})
+
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	c.JSON(http.StatusOK, RefundResponse{
+		Refunded:     true,
+		Amount:       preDeduct.Amount,
+		BalanceAfter: balanceAfter,
 	})
 }

@@ -12,10 +12,6 @@ import (
 )
 
 func SetApiRouter(router *gin.Engine) {
-	// SSO routes (outside /api group)
-	router.GET("/sso/authorize", controller.SSOAuthorize)
-	router.POST("/sso/token", controller.SSOTokenExchange)
-
 	apiRouter := router.Group("/api")
 	apiRouter.Use(middleware.RouteTag("api"))
 	apiRouter.Use(gzip.Gzip(gzip.DefaultCompression))
@@ -45,12 +41,6 @@ func SetApiRouter(router *gin.Engine) {
 		apiRouter.GET("/internal/usage", middleware.InternalTokenAuth(), controller.GetInternalUsage)
 		// Internal: aggregate gateway setup facts for the TapCanvas first-run gate.
 		apiRouter.GET("/internal/readiness", middleware.InternalTokenAuth(), controller.GetGatewayReadiness)
-		// Service: TapCanvas balance query (requires service token)
-		apiRouter.GET("/internal/v1/users/:id/wallet", middleware.ServiceTokenAuth(), controller.GetWalletBalance)
-		// Service: TapCanvas pre-deduct credits endpoint (requires service token)
-		apiRouter.POST("/internal/v1/wallet/pre-deduct", middleware.ServiceTokenAuth(), controller.PreDeductCredits)
-		// Service: TapCanvas settle credits endpoint (requires service token)
-		apiRouter.POST("/internal/v1/wallet/settle", middleware.ServiceTokenAuth(), controller.SettleCredits)
 		apiRouter.GET("/verification", middleware.EmailVerificationRateLimit(), middleware.TurnstileCheck(), controller.SendEmailVerification)
 		apiRouter.GET("/captcha", middleware.CriticalRateLimit(), controller.GetCaptcha)
 		apiRouter.GET("/reset_password", middleware.CriticalRateLimit(), middleware.TurnstileCheck(), controller.SendPasswordResetEmail)
@@ -403,6 +393,18 @@ func SetApiRouter(router *gin.Engine) {
 			deploymentsRoute.PUT("/:id/name", controller.UpdateDeploymentName)
 			deploymentsRoute.POST("/:id/extend", controller.ExtendDeployment)
 			deploymentsRoute.DELETE("/:id", controller.DeleteDeployment)
+		}
+
+		// Internal v1 API (service-to-service communication)
+		internal := apiRouter.Group("/internal/v1")
+		internal.Use(middleware.InternalTokenAuth())
+		{
+			walletRoute := internal.Group("/wallet")
+			{
+				walletRoute.POST("/pre-deduct", controller.PreDeductCredits)
+				walletRoute.POST("/settle", controller.SettleCredits)
+				walletRoute.POST("/refund", controller.RefundCredits)
+			}
 		}
 	}
 }
