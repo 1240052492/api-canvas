@@ -211,9 +211,29 @@ func RefundCredits(c *gin.Context) {
 	}
 
 	// Check idempotency
-	existing, _ := model.GetTransactionByIdempotencyKey(req.IdempotencyKey)
+	existing, err := model.GetTransactionByIdempotencyKey(req.IdempotencyKey)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "database_error"})
+		return
+	}
 	if existing != nil {
-		c.JSON(http.StatusOK, RefundResponse{Refunded: true, Amount: existing.Amount})
+		// Return existing result with current balance
+		var preDeduct model.WalletTransaction
+		if err := model.DB.Where("id = ?", existing.DeductionId).First(&preDeduct).Error; err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "deduction_not_found"})
+			return
+		}
+		user, err := model.GetUserById(preDeduct.UserId, false)
+		if err != nil || user == nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "user_not_found"})
+			return
+		}
+		balance := int64(user.Quota) - int64(user.UsedQuota)
+		c.JSON(http.StatusOK, RefundResponse{
+			Refunded:     true,
+			Amount:       existing.Amount,
+			BalanceAfter: balance,
+		})
 		return
 	}
 
@@ -226,7 +246,7 @@ func RefundCredits(c *gin.Context) {
 
 	var balanceAfter int64
 
-	err := model.DB.Transaction(func(tx *gorm.DB) error {
+	err = model.DB.Transaction(func(tx *gorm.DB) error {
 		var user model.User
 		if err := tx.Where("id = ?", preDeduct.UserId).First(&user).Error; err != nil {
 			return err
@@ -239,7 +259,9 @@ func RefundCredits(c *gin.Context) {
 
 		balanceAfter = int64(user.Quota) - int64(user.UsedQuota) + preDeduct.Amount
 
-		// Record refund transaction
+		// Record refund transaction with properly marshaled metadata
+		metadataMap := map[string]string{"reason": req.Reason}
+		metadataJSON, _ := json.Marshal(metadataMap)
 		refundTx := &model.WalletTransaction{
 			Id:             "refund_" + generateRandomString(16),
 			UserId:         preDeduct.UserId,
@@ -247,7 +269,7 @@ func RefundCredits(c *gin.Context) {
 			Amount:         preDeduct.Amount,
 			IdempotencyKey: req.IdempotencyKey,
 			DeductionId:    req.DeductionId,
-			Metadata:       `{"reason":"` + req.Reason + `"}`,
+			Metadata:       string(metadataJSON),
 		}
 		return tx.Create(refundTx).Error
 	})

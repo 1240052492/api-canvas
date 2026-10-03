@@ -397,7 +397,7 @@ func SetApiRouter(router *gin.Engine) {
 
 		// Internal v1 API (service-to-service communication)
 		internal := apiRouter.Group("/internal/v1")
-		internal.Use(middleware.InternalTokenAuth())
+		internal.Use(middleware.ServiceTokenAuth())
 		{
 			walletRoute := internal.Group("/wallet")
 			{
