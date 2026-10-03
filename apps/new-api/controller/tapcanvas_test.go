@@ -1,10 +1,11 @@
 package controller
 
 import (
-	"bytes"
 	"encoding/json"
+	"fmt"
 	"net/http/httptest"
 	"os"
+	"regexp"
 	"testing"
 
 	"github.com/QuantumNous/new-api/common"
@@ -70,14 +71,11 @@ func TestQueryUserBalanceSuccess(t *testing.T) {
 
 	router := gin.New()
 	router.Use(middleware.ServiceTokenAuth())
-	router.POST("/service/balance", QueryUserBalance)
+	router.GET("/internal/v1/users/:user_id/wallet", QueryUserBalance)
 
-	reqBody := BalanceQueryRequest{UserID: user.Id}
-	bodyBytes, _ := json.Marshal(reqBody)
-
-	req := httptest.NewRequest("POST", "/service/balance", bytes.NewReader(bodyBytes))
+	url := fmt.Sprintf("/internal/v1/users/%d/wallet", user.Id)
+	req := httptest.NewRequest("GET", url, nil)
 	req.Header.Set("Authorization", "Bearer sk-canvas-balance-test")
-	req.Header.Set("Content-Type", "application/json")
 	w := httptest.NewRecorder()
 	router.ServeHTTP(w, req)
 
@@ -89,6 +87,11 @@ func TestQueryUserBalanceSuccess(t *testing.T) {
 	assert.Equal(t, 500000, resp.Balance)
 	assert.Equal(t, 100000, resp.UsedQuota)
 	assert.NotEmpty(t, resp.DisplayBalance)
+
+	// Verify display_balance format: $X.XX
+	matched, err := regexp.MatchString(`^\$\d+\.\d{2}$`, resp.DisplayBalance)
+	assert.NoError(t, err)
+	assert.True(t, matched, "display_balance should match format $X.XX, got: %s", resp.DisplayBalance)
 }
 
 func TestQueryUserBalanceUserNotFound(t *testing.T) {
@@ -109,14 +112,10 @@ func TestQueryUserBalanceUserNotFound(t *testing.T) {
 
 	router := gin.New()
 	router.Use(middleware.ServiceTokenAuth())
-	router.POST("/service/balance", QueryUserBalance)
+	router.GET("/internal/v1/users/:user_id/wallet", QueryUserBalance)
 
-	reqBody := BalanceQueryRequest{UserID: 99999}
-	bodyBytes, _ := json.Marshal(reqBody)
-
-	req := httptest.NewRequest("POST", "/service/balance", bytes.NewReader(bodyBytes))
+	req := httptest.NewRequest("GET", "/internal/v1/users/99999/wallet", nil)
 	req.Header.Set("Authorization", "Bearer sk-canvas-balance-test2")
-	req.Header.Set("Content-Type", "application/json")
 	w := httptest.NewRecorder()
 	router.ServeHTTP(w, req)
 
@@ -142,12 +141,11 @@ func TestQueryUserBalanceInvalidRequest(t *testing.T) {
 
 	router := gin.New()
 	router.Use(middleware.ServiceTokenAuth())
-	router.POST("/service/balance", QueryUserBalance)
+	router.GET("/internal/v1/users/:user_id/wallet", QueryUserBalance)
 
-	// Missing user_id
-	req := httptest.NewRequest("POST", "/service/balance", bytes.NewReader([]byte("{}")))
+	// Invalid user_id (not a number)
+	req := httptest.NewRequest("GET", "/internal/v1/users/invalid/wallet", nil)
 	req.Header.Set("Authorization", "Bearer sk-canvas-balance-test3")
-	req.Header.Set("Content-Type", "application/json")
 	w := httptest.NewRecorder()
 	router.ServeHTTP(w, req)
 
