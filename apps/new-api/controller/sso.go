@@ -61,3 +61,44 @@ func SSOAuthorize(c *gin.Context) {
 	}
 	c.Redirect(http.StatusFound, location)
 }
+
+type SSOTokenRequest struct {
+	Code        string `json:"code" binding:"required"`
+	RedirectUri string `json:"redirect_uri" binding:"required"`
+}
+
+type SSOTokenResponse struct {
+	UserId    int    `json:"user_id"`
+	Username  string `json:"username"`
+	Email     string `json:"email"`
+	AvatarUrl string `json:"avatar_url"`
+	ExpiresIn int    `json:"expires_in"`
+}
+
+func SSOTokenExchange(c *gin.Context) {
+	var req SSOTokenRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid_request"})
+		return
+	}
+
+	authCode, err := model.ConsumeAuthCode(req.Code, req.RedirectUri)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	user, err := model.GetUserById(authCode.UserId, false)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "user not found"})
+		return
+	}
+
+	c.JSON(http.StatusOK, SSOTokenResponse{
+		UserId:    user.Id,
+		Username:  user.Username,
+		Email:     user.Email,
+		AvatarUrl: "",
+		ExpiresIn: 2592000, // 30 days
+	})
+}

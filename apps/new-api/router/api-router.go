@@ -14,6 +14,7 @@ import (
 func SetApiRouter(router *gin.Engine) {
 	// SSO routes (outside /api group)
 	router.GET("/sso/authorize", controller.SSOAuthorize)
+	router.POST("/sso/token", controller.SSOTokenExchange)
 
 	apiRouter := router.Group("/api")
 	apiRouter.Use(middleware.RouteTag("api"))
