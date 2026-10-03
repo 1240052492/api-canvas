@@ -403,6 +403,7 @@ func SetApiRouter(router *gin.Engine) {
 			{
 				walletRoute.POST("/pre-deduct", controller.PreDeductCredits)
 				walletRoute.POST("/settle", controller.SettleCredits)
+				walletRoute.POST("/refund", controller.RefundCredits)
 			}
 		}
 	}

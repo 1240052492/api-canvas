@@ -62,6 +62,7 @@ func setupTestRouterWithServiceAuth() *gin.Engine {
 	internal := router.Group("/internal/v1")
 	internal.POST("/wallet/pre-deduct", PreDeductCredits)
 	internal.POST("/wallet/settle", SettleCredits)
+	internal.POST("/wallet/refund", RefundCredits)
 
 	return router
 }
@@ -254,4 +255,68 @@ func TestPreDeductInsufficientBalance(t *testing.T) {
 	var resp map[string]interface{}
 	json.Unmarshal(w.Body.Bytes(), &resp)
 	assert.Equal(t, "INSUFFICIENT_QUOTA", resp["code"])
+}
+
+func TestRefundCredits(t *testing.T) {
+	setupInternalWalletTestDB(t)
+	user := createTestUserWithQuota(2000000)
+	deductionId := preDeductForTest(user.Id, 10000, "refund_test")
+
+	router := setupTestRouterWithServiceAuth()
+	body := `{
+        "deduction_id": "` + deductionId + `",
+        "idempotency_key": "` + strconv.Itoa(user.Id) + `_task_refund_test_refund",
+        "reason": "upstream_error"
+    }`
+	req := httptest.NewRequest("POST", "/internal/v1/wallet/refund", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+testServiceToken)
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	assert.Equal(t, 200, w.Code)
+	var resp map[string]interface{}
+	json.Unmarshal(w.Body.Bytes(), &resp)
+	assert.True(t, resp["refunded"].(bool))
+	assert.Equal(t, float64(10000), resp["amount"])
+	assert.Equal(t, float64(2000000), resp["balance_after"])
+
+	// Verify used_quota back to 0
+	user, _ = model.GetUserById(user.Id, false)
+	assert.Equal(t, int(0), user.UsedQuota)
+}
+
+func TestRefundIdempotency(t *testing.T) {
+	setupInternalWalletTestDB(t)
+	user := createTestUserWithQuota(2000000)
+	deductionId := preDeductForTest(user.Id, 10000, "refund_idem")
+	idempotencyKey := strconv.Itoa(user.Id) + "_task_refund_idem_refund"
+
+	body := `{
+        "deduction_id": "` + deductionId + `",
+        "idempotency_key": "` + idempotencyKey + `",
+        "reason": "test"
+    }`
+
+	router := setupTestRouterWithServiceAuth()
+
+	// First refund
+	req1 := httptest.NewRequest("POST", "/internal/v1/wallet/refund", strings.NewReader(body))
+	req1.Header.Set("Content-Type", "application/json")
+	req1.Header.Set("Authorization", "Bearer "+testServiceToken)
+	w1 := httptest.NewRecorder()
+	router.ServeHTTP(w1, req1)
+	assert.Equal(t, 200, w1.Code)
+
+	// Second refund
+	req2 := httptest.NewRequest("POST", "/internal/v1/wallet/refund", strings.NewReader(body))
+	req2.Header.Set("Content-Type", "application/json")
+	req2.Header.Set("Authorization", "Bearer "+testServiceToken)
+	w2 := httptest.NewRecorder()
+	router.ServeHTTP(w2, req2)
+	assert.Equal(t, 200, w2.Code)
+
+	// Verify refunded only once
+	user, _ = model.GetUserById(user.Id, false)
+	assert.Equal(t, int(0), user.UsedQuota)
 }

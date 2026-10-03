@@ -190,3 +190,76 @@ func SettleCredits(c *gin.Context) {
 		BalanceAfter:   balanceAfter,
 	})
 }
+
+type RefundRequest struct {
+	DeductionId    string `json:"deduction_id" binding:"required"`
+	IdempotencyKey string `json:"idempotency_key" binding:"required"`
+	Reason         string `json:"reason"`
+}
+
+type RefundResponse struct {
+	Refunded     bool  `json:"refunded"`
+	Amount       int64 `json:"amount"`
+	BalanceAfter int64 `json:"balance_after"`
+}
+
+func RefundCredits(c *gin.Context) {
+	var req RefundRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid_request"})
+		return
+	}
+
+	// Check idempotency
+	existing, _ := model.GetTransactionByIdempotencyKey(req.IdempotencyKey)
+	if existing != nil {
+		c.JSON(http.StatusOK, RefundResponse{Refunded: true, Amount: existing.Amount})
+		return
+	}
+
+	// Get pre-deduct transaction
+	var preDeduct model.WalletTransaction
+	if err := model.DB.Where("id = ? AND type = ?", req.DeductionId, "pre_deduct").First(&preDeduct).Error; err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "deduction_not_found"})
+		return
+	}
+
+	var balanceAfter int64
+
+	err := model.DB.Transaction(func(tx *gorm.DB) error {
+		var user model.User
+		if err := tx.Where("id = ?", preDeduct.UserId).First(&user).Error; err != nil {
+			return err
+		}
+
+		// Refund full amount
+		if err := tx.Model(&user).Update("used_quota", gorm.Expr("used_quota - ?", preDeduct.Amount)).Error; err != nil {
+			return err
+		}
+
+		balanceAfter = int64(user.Quota) - int64(user.UsedQuota) + preDeduct.Amount
+
+		// Record refund transaction
+		refundTx := &model.WalletTransaction{
+			Id:             "refund_" + generateRandomString(16),
+			UserId:         preDeduct.UserId,
+			Type:           "refund",
+			Amount:         preDeduct.Amount,
+			IdempotencyKey: req.IdempotencyKey,
+			DeductionId:    req.DeductionId,
+			Metadata:       `{"reason":"` + req.Reason + `"}`,
+		}
+		return tx.Create(refundTx).Error
+	})
+
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	c.JSON(http.StatusOK, RefundResponse{
+		Refunded:     true,
+		Amount:       preDeduct.Amount,
+		BalanceAfter: balanceAfter,
+	})
+}
