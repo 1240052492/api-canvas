@@ -273,6 +273,7 @@ func migrateDB() error {
 		&UserOAuthBinding{},
 		&RequestTrace{},
 		&WalletTransaction{},
+		&AuthCode{},
 	)
 	if err != nil {
 		return err
