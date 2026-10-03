@@ -1,0 +1,148 @@
+package controller
+
+import (
+	"context"
+	"fmt"
+	"net/http"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/constant"
+	"github.com/QuantumNous/new-api/model"
+	"github.com/QuantumNous/new-api/relay/channel/codex"
+	"github.com/QuantumNous/new-api/service"
+
+	"github.com/gin-gonic/gin"
+)
+
+func GetCodexChannelUsage(c *gin.Context) {
+	channelId, err := strconv.Atoi(c.Param("id"))
+	if err != nil {
+		common.ApiError(c, fmt.Errorf("invalid channel id: %w", err))
+		return
+	}
+
+	ch, err := model.GetChannelById(channelId, true)
+	if err != nil {
+		common.ApiError(c, err)
+		return
+	}
+	if ch == nil {
+		c.JSON(http.StatusOK, gin.H{"success": false, "message": "channel not found"})
+		return
+	}
+	if ch.Type != constant.ChannelTypeCodex {
+		c.JSON(http.StatusOK, gin.H{"success": false, "message": "channel type is not Codex"})
+		return
+	}
+	if ch.ChannelInfo.IsMultiKey {
+		usage, refreshErr := service.RefreshCodexChannelUsageLifecycle(c.Request.Context(), channelId, time.Now())
+		if refreshErr != nil {
+			common.SysError("failed to refresh multi-key Codex usage: " + refreshErr.Error())
+			c.JSON(http.StatusOK, gin.H{"success": false, "message": refreshErr.Error(), "data": usage})
+			return
+		}
+		c.JSON(http.StatusOK, gin.H{
+			"success": true,
+			"message": "",
+			"data": gin.H{
+				"accounts":                  usage,
+				"minimum_remaining_percent": service.CodexMinimumRemainingPercent,
+			},
+		})
+		return
+	}
+
+	oauthKey, err := codex.ParseOAuthKey(strings.TrimSpace(ch.Key))
+	if err != nil {
+		common.SysError("failed to parse oauth key: " + err.Error())
+		c.JSON(http.StatusOK, gin.H{"success": false, "message": "解析凭证失败，请检查渠道配置"})
+		return
+	}
+	accessToken := strings.TrimSpace(oauthKey.AccessToken)
+	accountID := strings.TrimSpace(oauthKey.AccountID)
+	if accessToken == "" {
+		c.JSON(http.StatusOK, gin.H{"success": false, "message": "codex channel: access_token is required"})
+		return
+	}
+	if accountID == "" {
+		c.JSON(http.StatusOK, gin.H{"success": false, "message": "codex channel: account_id is required"})
+		return
+	}
+
+	client, err := service.NewProxyHttpClient(ch.GetSetting().Proxy)
+	if err != nil {
+		common.ApiError(c, err)
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 15*time.Second)
+	defer cancel()
+
+	statusCode, body, err := service.FetchCodexWhamUsage(ctx, client, ch.GetBaseURL(), accessToken, accountID)
+	if err != nil {
+		common.SysError("failed to fetch codex usage: " + err.Error())
+		c.JSON(http.StatusOK, gin.H{"success": false, "message": "获取用量信息失败，请稍后重试"})
+		return
+	}
+
+	if (statusCode == http.StatusUnauthorized || statusCode == http.StatusForbidden) && strings.TrimSpace(oauthKey.RefreshToken) != "" {
+		refreshCtx, refreshCancel := context.WithTimeout(c.Request.Context(), 10*time.Second)
+		defer refreshCancel()
+
+		res, refreshErr := service.RefreshCodexOAuthTokenWithProxy(refreshCtx, oauthKey.RefreshToken, ch.GetSetting().Proxy)
+		if refreshErr != nil {
+			common.ApiErrorMsg(c, "Codex OAuth 令牌刷新失败: "+refreshErr.Error())
+			return
+		}
+		oauthKey.AccessToken = res.AccessToken
+		oauthKey.RefreshToken = res.RefreshToken
+		oauthKey.LastRefresh = time.Now().Format(time.RFC3339)
+		oauthKey.Expired = res.ExpiresAt.Format(time.RFC3339)
+		if strings.TrimSpace(oauthKey.Type) == "" {
+			oauthKey.Type = "codex"
+		}
+
+		encoded, encErr := common.Marshal(oauthKey)
+		if encErr != nil {
+			common.ApiErrorMsg(c, "Codex OAuth 令牌已刷新，但凭据序列化失败: "+encErr.Error())
+			return
+		}
+		if err := model.DB.Model(&model.Channel{}).Where("id = ?", ch.Id).Update("key", string(encoded)).Error; err != nil {
+			common.ApiErrorMsg(c, "Codex OAuth 令牌已刷新，但凭据保存失败: "+err.Error())
+			return
+		}
+		service.ResetProxyClientCache()
+		if !refreshChannelCacheAfterWrite(c, "Codex OAuth 令牌已刷新并保存") {
+			return
+		}
+
+		ctx2, cancel2 := context.WithTimeout(c.Request.Context(), 15*time.Second)
+		defer cancel2()
+		statusCode, body, err = service.FetchCodexWhamUsage(ctx2, client, ch.GetBaseURL(), oauthKey.AccessToken, accountID)
+		if err != nil {
+			common.SysError("failed to fetch codex usage after refresh: " + err.Error())
+			c.JSON(http.StatusOK, gin.H{"success": false, "message": "获取用量信息失败，请稍后重试"})
+			return
+		}
+	}
+
+	var payload any
+	if common.Unmarshal(body, &payload) != nil {
+		payload = string(body)
+	}
+
+	ok := statusCode >= 200 && statusCode < 300
+	resp := gin.H{
+		"success":         ok,
+		"message":         "",
+		"upstream_status": statusCode,
+		"data":            payload,
+	}
+	if !ok {
+		resp["message"] = fmt.Sprintf("upstream status: %d", statusCode)
+	}
+	c.JSON(http.StatusOK, resp)
+}

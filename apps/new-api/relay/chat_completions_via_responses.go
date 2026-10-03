@@ -1,0 +1,225 @@
+package relay
+
+import (
+	"bytes"
+	"errors"
+	"net/http"
+	"strings"
+
+	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/constant"
+	"github.com/QuantumNous/new-api/dto"
+	"github.com/QuantumNous/new-api/model"
+	"github.com/QuantumNous/new-api/relay/channel"
+	openaichannel "github.com/QuantumNous/new-api/relay/channel/openai"
+	relaycommon "github.com/QuantumNous/new-api/relay/common"
+	relayconstant "github.com/QuantumNous/new-api/relay/constant"
+	"github.com/QuantumNous/new-api/service"
+	"github.com/QuantumNous/new-api/types"
+
+	"github.com/gin-gonic/gin"
+)
+
+func applySystemPromptIfNeeded(c *gin.Context, info *relaycommon.RelayInfo, request *dto.GeneralOpenAIRequest) {
+	if info == nil || request == nil {
+		return
+	}
+	if info.ChannelSetting.SystemPrompt == "" {
+		return
+	}
+
+	systemRole := request.GetSystemRoleName()
+
+	containSystemPrompt := false
+	for _, message := range request.Messages {
+		if message.Role == systemRole {
+			containSystemPrompt = true
+			break
+		}
+	}
+	if !containSystemPrompt {
+		systemMessage := dto.Message{
+			Role:    systemRole,
+			Content: info.ChannelSetting.SystemPrompt,
+		}
+		request.Messages = append([]dto.Message{systemMessage}, request.Messages...)
+		return
+	}
+
+	if !info.ChannelSetting.SystemPromptOverride {
+		return
+	}
+
+	common.SetContextKey(c, constant.ContextKeySystemPromptOverride, true)
+	for i, message := range request.Messages {
+		if message.Role != systemRole {
+			continue
+		}
+		if message.IsStringContent() {
+			request.Messages[i].SetStringContent(info.ChannelSetting.SystemPrompt + "\n" + message.StringContent())
+			return
+		}
+		contents := message.ParseContent()
+		contents = append([]dto.MediaContent{
+			{
+				Type: dto.ContentTypeText,
+				Text: info.ChannelSetting.SystemPrompt,
+			},
+		}, contents...)
+		request.Messages[i].Content = contents
+		return
+	}
+}
+
+func chatCompletionsViaResponses(c *gin.Context, info *relaycommon.RelayInfo, adaptor channel.Adaptor, request *dto.GeneralOpenAIRequest) (*dto.Usage, *types.NewAPIError) {
+	chatJSON, err := common.Marshal(request)
+	if err != nil {
+		upsertRequestTraceAttempt(c, info, model.RequestTraceAttemptPatch{ErrorMessage: err.Error()})
+		return nil, types.NewError(err, types.ErrorCodeConvertRequestFailed, types.ErrOptionWithSkipRetry())
+	}
+
+	chatJSON, err = relaycommon.RemoveDisabledFields(chatJSON, info.ChannelOtherSettings, info.ChannelSetting.PassThroughBodyEnabled)
+	if err != nil {
+		upsertRequestTraceAttempt(c, info, model.RequestTraceAttemptPatch{ErrorMessage: err.Error()})
+		return nil, types.NewError(err, types.ErrorCodeConvertRequestFailed, types.ErrOptionWithSkipRetry())
+	}
+
+	if len(info.ParamOverride) > 0 {
+		chatJSON, err = relaycommon.ApplyParamOverrideWithRelayInfo(chatJSON, info)
+		if err != nil {
+			upsertRequestTraceAttempt(c, info, model.RequestTraceAttemptPatch{ErrorMessage: err.Error()})
+			return nil, NewAPIErrorFromParamOverride(err)
+		}
+	}
+
+	var overriddenChatReq dto.GeneralOpenAIRequest
+	if err := common.Unmarshal(chatJSON, &overriddenChatReq); err != nil {
+		upsertRequestTraceAttempt(c, info, model.RequestTraceAttemptPatch{ErrorMessage: err.Error()})
+		return nil, types.NewError(err, types.ErrorCodeChannelParamOverrideInvalid, types.ErrOptionWithSkipRetry())
+	}
+
+	responsesReq, err := service.ChatCompletionsRequestToResponsesRequest(&overriddenChatReq)
+	if err != nil {
+		upsertRequestTraceAttempt(c, info, model.RequestTraceAttemptPatch{ErrorMessage: err.Error()})
+		return nil, types.NewErrorWithStatusCode(err, types.ErrorCodeInvalidRequest, http.StatusBadRequest, types.ErrOptionWithSkipRetry())
+	}
+	info.AppendRequestConversion(types.RelayFormatOpenAIResponses)
+
+	savedRelayMode := info.RelayMode
+	savedRequestURLPath := info.RequestURLPath
+	defer func() {
+		info.RelayMode = savedRelayMode
+		info.RequestURLPath = savedRequestURLPath
+	}()
+
+	info.RelayMode = relayconstant.RelayModeResponses
+	info.RequestURLPath = "/v1/responses"
+
+	convertedRequest, err := adaptor.ConvertOpenAIResponsesRequest(c, info, *responsesReq)
+	if err != nil {
+		upsertRequestTraceAttempt(c, info, model.RequestTraceAttemptPatch{ErrorMessage: err.Error()})
+		return nil, types.NewError(err, types.ErrorCodeConvertRequestFailed, types.ErrOptionWithSkipRetry())
+	}
+	relaycommon.AppendRequestConversionFromRequest(info, convertedRequest)
+
+	jsonData, err := common.Marshal(convertedRequest)
+	if err != nil {
+		upsertRequestTraceAttempt(c, info, model.RequestTraceAttemptPatch{ErrorMessage: err.Error()})
+		return nil, types.NewError(err, types.ErrorCodeConvertRequestFailed, types.ErrOptionWithSkipRetry())
+	}
+
+	jsonData, err = relaycommon.RemoveDisabledFields(jsonData, info.ChannelOtherSettings, info.ChannelSetting.PassThroughBodyEnabled)
+	if err != nil {
+		upsertRequestTraceAttempt(c, info, model.RequestTraceAttemptPatch{ErrorMessage: err.Error()})
+		return nil, types.NewError(err, types.ErrorCodeConvertRequestFailed, types.ErrOptionWithSkipRetry())
+	}
+
+	upstreamURL, _ := adaptor.GetRequestURL(info)
+	upstreamRequestBody := string(jsonData)
+	upsertRequestTraceAttempt(c, info, model.RequestTraceAttemptPatch{
+		UpstreamURL:         upstreamURL,
+		UpstreamRequestBody: upstreamRequestBody,
+	})
+
+	var httpResp *http.Response
+	resp, err := adaptor.DoRequest(c, info, bytes.NewBuffer(jsonData))
+	if err != nil {
+		upsertRequestTraceAttempt(c, info, model.RequestTraceAttemptPatch{
+			UpstreamURL:         upstreamURL,
+			UpstreamRequestBody: upstreamRequestBody,
+			ErrorMessage:        err.Error(),
+		})
+		return nil, types.NewOpenAIError(err, types.ErrorCodeDoRequestFailed, http.StatusInternalServerError)
+	}
+	if resp == nil {
+		err := errors.New("upstream returned a nil response")
+		upsertRequestTraceAttempt(c, info, model.RequestTraceAttemptPatch{
+			UpstreamURL:         upstreamURL,
+			UpstreamRequestBody: upstreamRequestBody,
+			ErrorMessage:        err.Error(),
+		})
+		return nil, types.NewOpenAIError(err, types.ErrorCodeBadResponse, http.StatusInternalServerError)
+	}
+
+	statusCodeMappingStr := c.GetString("status_code_mapping")
+
+	var responseRecorder *responseTraceRecorder
+	httpResp = resp.(*http.Response)
+	info.IsStream = info.IsStream || strings.HasPrefix(httpResp.Header.Get("Content-Type"), "text/event-stream")
+	if !info.IsStream {
+		httpResp, responseRecorder = attachResponseTraceRecorder(httpResp)
+	}
+	if httpResp.StatusCode != http.StatusOK {
+		neoSparkMartErr := service.RelayErrorHandler(c.Request.Context(), httpResp, false)
+		responseBody := ""
+		if responseRecorder != nil {
+			responseBody = string(responseRecorder.data)
+		}
+		upsertRequestTraceAttempt(c, info, model.RequestTraceAttemptPatch{
+			UpstreamURL:          upstreamURL,
+			UpstreamRequestBody:  upstreamRequestBody,
+			UpstreamResponseBody: responseBody,
+			ErrorMessage:         neoSparkMartErr.Error(),
+		})
+		service.ResetStatusCode(neoSparkMartErr, statusCodeMappingStr)
+		return nil, neoSparkMartErr
+	}
+
+	if info.IsStream {
+		usage, neoSparkMartErr := openaichannel.OaiResponsesToChatStreamHandler(c, info, httpResp)
+		if neoSparkMartErr != nil {
+			upsertRequestTraceAttempt(c, info, model.RequestTraceAttemptPatch{
+				UpstreamURL:         upstreamURL,
+				UpstreamRequestBody: upstreamRequestBody,
+				ErrorMessage:        neoSparkMartErr.Error(),
+			})
+			service.ResetStatusCode(neoSparkMartErr, statusCodeMappingStr)
+			return nil, neoSparkMartErr
+		}
+		return usage, nil
+	}
+
+	usage, neoSparkMartErr := openaichannel.OaiResponsesToChatHandler(c, info, httpResp)
+	if neoSparkMartErr != nil {
+		responseBody := ""
+		if responseRecorder != nil {
+			responseBody = string(responseRecorder.data)
+		}
+		upsertRequestTraceAttempt(c, info, model.RequestTraceAttemptPatch{
+			UpstreamURL:          upstreamURL,
+			UpstreamRequestBody:  upstreamRequestBody,
+			UpstreamResponseBody: responseBody,
+			ErrorMessage:         neoSparkMartErr.Error(),
+		})
+		service.ResetStatusCode(neoSparkMartErr, statusCodeMappingStr)
+		return nil, neoSparkMartErr
+	}
+	if responseRecorder != nil {
+		upsertRequestTraceAttempt(c, info, model.RequestTraceAttemptPatch{
+			UpstreamURL:          upstreamURL,
+			UpstreamRequestBody:  upstreamRequestBody,
+			UpstreamResponseBody: string(responseRecorder.data),
+		})
+	}
+	return usage, nil
+}

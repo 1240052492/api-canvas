@@ -1,0 +1,996 @@
+package openai
+
+import (
+	"bytes"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"mime/multipart"
+	"net/http"
+	"net/textproto"
+	"path/filepath"
+	"strings"
+
+	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/constant"
+	"github.com/QuantumNous/new-api/dto"
+	"github.com/QuantumNous/new-api/logger"
+	"github.com/QuantumNous/new-api/relay/channel"
+	"github.com/QuantumNous/new-api/relay/channel/ai360"
+	"github.com/QuantumNous/new-api/relay/channel/lingyiwanwu"
+
+	//"github.com/QuantumNous/new-api/relay/channel/minimax"
+	"github.com/QuantumNous/new-api/relay/channel/openrouter"
+	"github.com/QuantumNous/new-api/relay/channel/xinference"
+	relaycommon "github.com/QuantumNous/new-api/relay/common"
+	"github.com/QuantumNous/new-api/relay/common_handler"
+	relayconstant "github.com/QuantumNous/new-api/relay/constant"
+	"github.com/QuantumNous/new-api/service"
+	"github.com/QuantumNous/new-api/setting/model_setting"
+	"github.com/QuantumNous/new-api/types"
+	"github.com/samber/lo"
+
+	"github.com/gin-gonic/gin"
+)
+
+type Adaptor struct {
+	ChannelType    int
+	ResponseFormat string
+}
+
+// parseReasoningEffortFromModelSuffix 从模型名称中解析推理级别
+// support OAI models: o1-mini/o3-mini/o4-mini/o1/o3 etc...
+// minimal effort only available in gpt-5
+func parseReasoningEffortFromModelSuffix(model string) (string, string) {
+	effortSuffixes := []string{"-high", "-minimal", "-low", "-medium", "-none", "-xhigh"}
+	for _, suffix := range effortSuffixes {
+		if strings.HasSuffix(model, suffix) {
+			effort := strings.TrimPrefix(suffix, "-")
+			originModel := strings.TrimSuffix(model, suffix)
+			return effort, originModel
+		}
+	}
+	return "", model
+}
+
+func (a *Adaptor) ConvertGeminiRequest(c *gin.Context, info *relaycommon.RelayInfo, request *dto.GeminiChatRequest) (any, error) {
+	// 使用 service.GeminiToOpenAIRequest 转换请求格式
+	openaiRequest, err := service.GeminiToOpenAIRequest(request, info)
+	if err != nil {
+		return nil, err
+	}
+	return a.ConvertOpenAIRequest(c, info, openaiRequest)
+}
+
+func (a *Adaptor) ConvertClaudeRequest(c *gin.Context, info *relaycommon.RelayInfo, request *dto.ClaudeRequest) (any, error) {
+	//if !strings.Contains(request.Model, "claude") {
+	//	return nil, fmt.Errorf("you are using openai channel type with path /v1/messages, only claude model supported convert, but got %s", request.Model)
+	//}
+	//if common.DebugEnabled {
+	//	bodyBytes := []byte(common.GetJsonString(request))
+	//	err := os.WriteFile(fmt.Sprintf("claude_request_%s.txt", c.GetString(common.RequestIdKey)), bodyBytes, 0644)
+	//	if err != nil {
+	//		println(fmt.Sprintf("failed to save request body to file: %v", err))
+	//	}
+	//}
+	aiRequest, err := service.ClaudeToOpenAIRequest(*request, info)
+	if err != nil {
+		return nil, err
+	}
+	//if common.DebugEnabled {
+	//	println(fmt.Sprintf("convert claude to openai request result: %s", common.GetJsonString(aiRequest)))
+	//	// Save request body to file for debugging
+	//	bodyBytes := []byte(common.GetJsonString(aiRequest))
+	//	err = os.WriteFile(fmt.Sprintf("claude_to_openai_request_%s.txt", c.GetString(common.RequestIdKey)), bodyBytes, 0644)
+	//	if err != nil {
+	//		println(fmt.Sprintf("failed to save request body to file: %v", err))
+	//	}
+	//}
+	if info.SupportStreamOptions && info.IsStream {
+		aiRequest.StreamOptions = &dto.StreamOptions{
+			IncludeUsage: true,
+		}
+	}
+	return a.ConvertOpenAIRequest(c, info, aiRequest)
+}
+
+func (a *Adaptor) Init(info *relaycommon.RelayInfo) {
+	a.ChannelType = info.ChannelType
+
+	// initialize ThinkingContentInfo when thinking_to_content is enabled
+	if info.ChannelSetting.ThinkingToContent {
+		info.ThinkingContentInfo = relaycommon.ThinkingContentInfo{
+			IsFirstThinkingContent:  true,
+			SendLastThinkingContent: false,
+			HasSentThinkingContent:  false,
+		}
+	}
+}
+
+func (a *Adaptor) GetRequestURL(info *relaycommon.RelayInfo) (string, error) {
+	if isFlow2APIProtocol(info) &&
+		(info.RelayMode == relayconstant.RelayModeImagesGenerations || info.RelayMode == relayconstant.RelayModeImagesEdits) {
+		return relaycommon.GetFullRequestURL(info.ChannelBaseUrl, "/v1/chat/completions", info.ProtocolID), nil
+	}
+	if info.RelayMode == relayconstant.RelayModeRealtime {
+		if strings.HasPrefix(info.ChannelBaseUrl, "https://") {
+			baseUrl := strings.TrimPrefix(info.ChannelBaseUrl, "https://")
+			baseUrl = "wss://" + baseUrl
+			info.ChannelBaseUrl = baseUrl
+		} else if strings.HasPrefix(info.ChannelBaseUrl, "http://") {
+			baseUrl := strings.TrimPrefix(info.ChannelBaseUrl, "http://")
+			baseUrl = "ws://" + baseUrl
+			info.ChannelBaseUrl = baseUrl
+		}
+	}
+	if info.ProtocolID == constant.ProtocolAzureOpenAI {
+		apiVersion := info.ApiVersion
+		if apiVersion == "" {
+			apiVersion = constant.AzureDefaultAPIVersion
+		}
+		// https://learn.microsoft.com/en-us/azure/cognitive-services/openai/chatgpt-quickstart?pivots=rest-api&tabs=command-line#rest-api
+		requestURL := strings.Split(info.RequestURLPath, "?")[0]
+		requestURL = fmt.Sprintf("%s?api-version=%s", requestURL, apiVersion)
+		task := strings.TrimPrefix(requestURL, "/v1/")
+
+		if info.RelayFormat == types.RelayFormatClaude {
+			task = strings.TrimPrefix(task, "messages")
+			task = "chat/completions" + task
+		}
+
+		// 特殊处理 responses API（包含 compact）
+		if info.RelayMode == relayconstant.RelayModeResponses || info.RelayMode == relayconstant.RelayModeResponsesCompact {
+			responsesApiVersion := "preview"
+
+			subUrl := "/openai/v1/responses"
+			if strings.Contains(info.ChannelBaseUrl, "cognitiveservices.azure.com") {
+				subUrl = "/openai/responses"
+				responsesApiVersion = apiVersion
+			}
+
+			if info.ChannelOtherSettings.AzureResponsesVersion != "" {
+				responsesApiVersion = info.ChannelOtherSettings.AzureResponsesVersion
+			}
+
+			// compact 模式追加 /compact
+			if info.RelayMode == relayconstant.RelayModeResponsesCompact {
+				subUrl = subUrl + "/compact"
+			}
+
+			requestURL = fmt.Sprintf("%s?api-version=%s", subUrl, responsesApiVersion)
+			return relaycommon.GetFullRequestURL(info.ChannelBaseUrl, requestURL, info.ProtocolID), nil
+		}
+
+		model_ := info.UpstreamModelName
+		// 2025年5月10日后创建的渠道不移除.
+		if info.ChannelCreateTime < constant.AzureNoRemoveDotTime {
+			model_ = strings.Replace(model_, ".", "", -1)
+		}
+		// https://github.com/songquanpeng/one-api/issues/67
+		requestURL = fmt.Sprintf("/openai/deployments/%s/%s", model_, task)
+		if info.RelayMode == relayconstant.RelayModeRealtime {
+			requestURL = fmt.Sprintf("/openai/realtime?deployment=%s&api-version=%s", model_, apiVersion)
+		}
+		return relaycommon.GetFullRequestURL(info.ChannelBaseUrl, requestURL, info.ProtocolID), nil
+	}
+	// Custom channels may use a full URL template for non-Azure-compatible
+	// protocols. Azure URL semantics are determined solely by ProtocolID above.
+	if info.ChannelType == constant.ChannelTypeCustom {
+		url := info.ChannelBaseUrl
+		url = strings.Replace(url, "{model}", info.UpstreamModelName, -1)
+		return url, nil
+	}
+	if (info.RelayFormat == types.RelayFormatClaude || info.RelayFormat == types.RelayFormatGemini) &&
+		info.RelayMode != relayconstant.RelayModeResponses &&
+		info.RelayMode != relayconstant.RelayModeResponsesCompact {
+		return fmt.Sprintf("%s/v1/chat/completions", info.ChannelBaseUrl), nil
+	}
+	return relaycommon.GetFullRequestURL(info.ChannelBaseUrl, info.RequestURLPath, info.ProtocolID), nil
+}
+
+func (a *Adaptor) SetupRequestHeader(c *gin.Context, header *http.Header, info *relaycommon.RelayInfo) error {
+	channel.SetupApiRequestHeader(info, c, header)
+	if info.ProtocolID == constant.ProtocolAzureOpenAI {
+		header.Set("api-key", info.ApiKey)
+		return nil
+	}
+	if info.ChannelType == constant.ChannelTypeOpenAI && "" != info.Organization {
+		header.Set("OpenAI-Organization", info.Organization)
+	}
+	// 检查 Header Override 是否已设置 Authorization，如果已设置则跳过默认设置
+	// 这样可以避免在 Header Override 应用时被覆盖（虽然 Header Override 会在之后应用，但这里作为额外保护）
+	hasAuthOverride := false
+	if len(info.HeadersOverride) > 0 {
+		for k := range info.HeadersOverride {
+			if strings.EqualFold(k, "Authorization") {
+				hasAuthOverride = true
+				break
+			}
+		}
+	}
+	if info.RelayMode == relayconstant.RelayModeRealtime {
+		swp := c.Request.Header.Get("Sec-WebSocket-Protocol")
+		if swp != "" {
+			items := []string{
+				"realtime",
+				"openai-insecure-api-key." + info.ApiKey,
+				"openai-beta.realtime-v1",
+			}
+			header.Set("Sec-WebSocket-Protocol", strings.Join(items, ","))
+			//req.Header.Set("Sec-WebSocket-Key", c.Request.Header.Get("Sec-WebSocket-Key"))
+			//req.Header.Set("Sec-Websocket-Extensions", c.Request.Header.Get("Sec-Websocket-Extensions"))
+			//req.Header.Set("Sec-Websocket-Version", c.Request.Header.Get("Sec-Websocket-Version"))
+		} else {
+			header.Set("openai-beta", "realtime=v1")
+			if !hasAuthOverride {
+				header.Set("Authorization", "Bearer "+info.ApiKey)
+			}
+		}
+	} else {
+		if !hasAuthOverride {
+			header.Set("Authorization", "Bearer "+info.ApiKey)
+		}
+	}
+	if info.ProtocolID == constant.ProtocolOpenRouter {
+		if header.Get("HTTP-Referer") == "" {
+			header.Set("HTTP-Referer", "https://www.neoSparkMart.ai")
+		}
+		if header.Get("X-OpenRouter-Title") == "" {
+			header.Set("X-OpenRouter-Title", "neoSparkMart")
+		}
+	}
+	return nil
+}
+
+func (a *Adaptor) ConvertOpenAIRequest(c *gin.Context, info *relaycommon.RelayInfo, request *dto.GeneralOpenAIRequest) (any, error) {
+	if request == nil {
+		return nil, errors.New("request is nil")
+	}
+	if isFlow2APIProtocol(info) {
+		if err := applyFlow2APIChatModel(c, info, request); err != nil {
+			return nil, err
+		}
+	}
+	if !info.SupportStreamOptions {
+		request.StreamOptions = nil
+	}
+	if info.ProtocolID == constant.ProtocolOpenRouter {
+		if len(request.Usage) == 0 {
+			request.Usage = json.RawMessage(`{"include":true}`)
+		}
+		// 适配 OpenRouter 的 thinking 后缀
+		if !model_setting.ShouldPreserveThinkingSuffix(info.OriginModelName) &&
+			strings.HasSuffix(info.UpstreamModelName, "-thinking") {
+			info.UpstreamModelName = strings.TrimSuffix(info.UpstreamModelName, "-thinking")
+			request.Model = info.UpstreamModelName
+			if len(request.Reasoning) == 0 {
+				reasoning := map[string]any{
+					"enabled": true,
+				}
+				if request.ReasoningEffort != "" && request.ReasoningEffort != "none" {
+					reasoning["effort"] = request.ReasoningEffort
+				}
+				marshal, err := common.Marshal(reasoning)
+				if err != nil {
+					return nil, fmt.Errorf("error marshalling reasoning: %w", err)
+				}
+				request.Reasoning = marshal
+			}
+			// 清空多余的ReasoningEffort
+			request.ReasoningEffort = ""
+		} else {
+			if len(request.Reasoning) == 0 {
+				// 适配 OpenAI 的 ReasoningEffort 格式
+				if request.ReasoningEffort != "" {
+					reasoning := map[string]any{
+						"enabled": true,
+					}
+					if request.ReasoningEffort != "none" {
+						reasoning["effort"] = request.ReasoningEffort
+						marshal, err := common.Marshal(reasoning)
+						if err != nil {
+							return nil, fmt.Errorf("error marshalling reasoning: %w", err)
+						}
+						request.Reasoning = marshal
+					}
+				}
+			}
+			request.ReasoningEffort = ""
+		}
+
+		// https://docs.anthropic.com/en/api/openai-sdk#extended-thinking-support
+		// 没有做排除3.5Haiku等，要出问题再加吧，最佳兼容性（不是
+		if request.THINKING != nil && strings.HasPrefix(info.UpstreamModelName, "anthropic") {
+			var thinking dto.Thinking // Claude标准Thinking格式
+			if err := json.Unmarshal(request.THINKING, &thinking); err != nil {
+				return nil, fmt.Errorf("error Unmarshal thinking: %w", err)
+			}
+
+			// 只有当 thinking.Type 是 "enabled" 时才处理
+			if thinking.Type == "enabled" {
+				// 检查 BudgetTokens 是否为 nil
+				if thinking.BudgetTokens == nil {
+					return nil, fmt.Errorf("BudgetTokens is nil when thinking is enabled")
+				}
+
+				reasoning := openrouter.RequestReasoning{
+					Enabled:   true,
+					MaxTokens: *thinking.BudgetTokens,
+				}
+
+				marshal, err := common.Marshal(reasoning)
+				if err != nil {
+					return nil, fmt.Errorf("error marshalling reasoning: %w", err)
+				}
+
+				request.Reasoning = marshal
+			}
+
+			// 清空 THINKING
+			request.THINKING = nil
+		}
+
+	}
+	if strings.HasPrefix(info.UpstreamModelName, "o") || strings.HasPrefix(info.UpstreamModelName, "gpt-5") {
+		if lo.FromPtrOr(request.MaxCompletionTokens, uint(0)) == 0 && lo.FromPtrOr(request.MaxTokens, uint(0)) != 0 {
+			request.MaxCompletionTokens = request.MaxTokens
+			request.MaxTokens = nil
+		}
+
+		if strings.HasPrefix(info.UpstreamModelName, "o") {
+			request.Temperature = nil
+		}
+
+		// gpt-5系列模型适配 归零不再支持的参数
+		if strings.HasPrefix(info.UpstreamModelName, "gpt-5") {
+			request.Temperature = nil
+			request.TopP = nil
+			request.LogProbs = nil
+		}
+
+		// 转换模型推理力度后缀
+		effort, originModel := parseReasoningEffortFromModelSuffix(info.UpstreamModelName)
+		if effort != "" {
+			request.ReasoningEffort = effort
+			info.UpstreamModelName = originModel
+			request.Model = originModel
+		}
+
+		info.ReasoningEffort = request.ReasoningEffort
+
+		// o系列模型developer适配（o1-mini除外）
+		if !strings.HasPrefix(info.UpstreamModelName, "o1-mini") && !strings.HasPrefix(info.UpstreamModelName, "o1-preview") {
+			//修改第一个Message的内容，将system改为developer
+			if len(request.Messages) > 0 && request.Messages[0].Role == "system" {
+				request.Messages[0].Role = "developer"
+			}
+		}
+	}
+
+	return request, nil
+}
+
+func (a *Adaptor) ConvertRerankRequest(c *gin.Context, relayMode int, request dto.RerankRequest) (any, error) {
+	return request, nil
+}
+
+func (a *Adaptor) ConvertEmbeddingRequest(c *gin.Context, info *relaycommon.RelayInfo, request dto.EmbeddingRequest) (any, error) {
+	return request, nil
+}
+
+func (a *Adaptor) ConvertAudioRequest(c *gin.Context, info *relaycommon.RelayInfo, request dto.AudioRequest) (io.Reader, error) {
+	a.ResponseFormat = request.ResponseFormat
+	if info.RelayMode == relayconstant.RelayModeAudioSpeech {
+		jsonData, err := common.Marshal(request)
+		if err != nil {
+			return nil, fmt.Errorf("error marshalling object: %w", err)
+		}
+		return bytes.NewReader(jsonData), nil
+	} else {
+		var requestBody bytes.Buffer
+		writer := multipart.NewWriter(&requestBody)
+
+		writer.WriteField("model", request.Model)
+
+		formData, err2 := common.ParseMultipartFormReusable(c)
+		if err2 != nil {
+			return nil, fmt.Errorf("error parsing multipart form: %w", err2)
+		}
+
+		// 打印类似 curl 命令格式的信息
+		logger.LogDebug(c.Request.Context(), fmt.Sprintf("--form 'model=\"%s\"'", request.Model))
+
+		// 遍历表单字段并打印输出
+		for key, values := range formData.Value {
+			if key == "model" {
+				continue
+			}
+			for _, value := range values {
+				writer.WriteField(key, value)
+				logger.LogDebug(c.Request.Context(), fmt.Sprintf("--form '%s=\"%s\"'", key, value))
+			}
+		}
+
+		// 从 formData 中获取文件
+		fileHeaders := formData.File["file"]
+		if len(fileHeaders) == 0 {
+			return nil, errors.New("file is required")
+		}
+
+		// 使用 formData 中的第一个文件
+		fileHeader := fileHeaders[0]
+		logger.LogDebug(c.Request.Context(), fmt.Sprintf("--form 'file=@\"%s\"' (size: %d bytes, content-type: %s)",
+			fileHeader.Filename, fileHeader.Size, fileHeader.Header.Get("Content-Type")))
+
+		file, err := fileHeader.Open()
+		if err != nil {
+			return nil, fmt.Errorf("error opening audio file: %v", err)
+		}
+		defer file.Close()
+
+		part, err := writer.CreateFormFile("file", fileHeader.Filename)
+		if err != nil {
+			return nil, errors.New("create form file failed")
+		}
+		if _, err := io.Copy(part, file); err != nil {
+			return nil, errors.New("copy file failed")
+		}
+
+		// 关闭 multipart 编写器以设置分界线
+		writer.Close()
+		c.Request.Header.Set("Content-Type", writer.FormDataContentType())
+		logger.LogDebug(c.Request.Context(), fmt.Sprintf("--header 'Content-Type: %s'", writer.FormDataContentType()))
+		return &requestBody, nil
+	}
+}
+
+func (a *Adaptor) ConvertImageRequest(c *gin.Context, info *relaycommon.RelayInfo, request dto.ImageRequest) (any, error) {
+	if isFlow2APIProtocol(info) {
+		if info.RelayMode == relayconstant.RelayModeImagesEdits {
+			return nil, errors.New("flow2api protocol does not support /v1/images/edits")
+		}
+		return convertFlow2APIImageRequest(c, info, request)
+	}
+	if trimmed := strings.TrimSuffix(request.Model, "-official"); trimmed != request.Model {
+		request.Model = trimmed
+		info.UpstreamModelName = trimmed
+	}
+	isGaiscImage2 := info.ChannelType == constant.ChannelTypeGaiscImage && strings.HasPrefix(request.Model, "gpt-image-2")
+	if isGaiscImage2 {
+		var err error
+		request, err = normalizeGaiscImageRequest(request)
+		if err != nil {
+			return nil, err
+		}
+	}
+	sizeTransport := info.ProtocolOptions["image_size_transport"]
+	if sizeTransport != "" && sizeTransport != "passthrough" {
+		return nil, fmt.Errorf("unsupported image_size_transport %q", sizeTransport)
+	}
+	if sizeTransport != "passthrough" && strings.HasPrefix(request.Model, "gpt-image-2") {
+		var err error
+		request, err = dto.NormalizeGptImage2Size(request)
+		if err != nil {
+			return nil, err
+		}
+	}
+	if isGaiscImage2 {
+		var err error
+		request, err = stripGaiscImageTransportAliases(request)
+		if err != nil {
+			return nil, err
+		}
+		if len(request.Images) > 0 && info.RelayMode == relayconstant.RelayModeImagesGenerations {
+			info.RelayMode = relayconstant.RelayModeImagesEdits
+			info.RequestURLPath = "/v1/images/edits"
+			c.Request.Header.Set("Content-Type", "application/json")
+		}
+	}
+	switch info.RelayMode {
+	case relayconstant.RelayModeImagesEdits:
+		if !strings.Contains(c.Request.Header.Get("Content-Type"), "multipart/form-data") {
+			if len(request.Images) == 0 {
+				return nil, errors.New("images is required for JSON image edits")
+			}
+			c.Request.Header.Set("Content-Type", "application/json")
+			return request, nil
+		}
+
+		var requestBody bytes.Buffer
+		writer := multipart.NewWriter(&requestBody)
+
+		writer.WriteField("model", request.Model)
+		// 使用已解析的 multipart 表单，避免重复解析
+		mf := c.Request.MultipartForm
+		if mf == nil {
+			if _, err := c.MultipartForm(); err != nil {
+				return nil, errors.New("failed to parse multipart form")
+			}
+			mf = c.Request.MultipartForm
+		}
+
+		// 写入所有非文件字段
+		if mf != nil {
+			for key, values := range mf.Value {
+				if key == "model" {
+					continue
+				}
+				for _, value := range values {
+					writer.WriteField(key, value)
+				}
+			}
+		}
+
+		if mf != nil && mf.File != nil {
+			// Check if "image" field exists in any form, including array notation
+			var imageFiles []*multipart.FileHeader
+			var exists bool
+
+			// First check for standard "image" field
+			if imageFiles, exists = mf.File["image"]; !exists || len(imageFiles) == 0 {
+				// If not found, check for "image[]" field
+				if imageFiles, exists = mf.File["image[]"]; !exists || len(imageFiles) == 0 {
+					// If still not found, iterate through all fields to find any that start with "image["
+					foundArrayImages := false
+					for fieldName, files := range mf.File {
+						if strings.HasPrefix(fieldName, "image[") && len(files) > 0 {
+							foundArrayImages = true
+							imageFiles = append(imageFiles, files...)
+						}
+					}
+
+					// If no image fields found at all
+					if !foundArrayImages && (len(imageFiles) == 0) {
+						return nil, errors.New("image is required")
+					}
+				}
+			}
+
+			// Process all image files
+			for i, fileHeader := range imageFiles {
+				file, err := fileHeader.Open()
+				if err != nil {
+					return nil, fmt.Errorf("failed to open image file %d: %w", i, err)
+				}
+
+				// If multiple images, use image[] as the field name
+				fieldName := "image"
+				if len(imageFiles) > 1 {
+					fieldName = "image[]"
+				}
+
+				// Determine MIME type based on file extension
+				mimeType := detectImageMimeType(fileHeader.Filename)
+
+				// Create a form file with the appropriate content type
+				h := make(textproto.MIMEHeader)
+				h.Set("Content-Disposition", fmt.Sprintf(`form-data; name="%s"; filename="%s"`, fieldName, fileHeader.Filename))
+				h.Set("Content-Type", mimeType)
+
+				part, err := writer.CreatePart(h)
+				if err != nil {
+					return nil, fmt.Errorf("create form part failed for image %d: %w", i, err)
+				}
+
+				if _, err := io.Copy(part, file); err != nil {
+					return nil, fmt.Errorf("copy file failed for image %d: %w", i, err)
+				}
+
+				// 复制完立即关闭，避免在循环内使用 defer 占用资源
+				_ = file.Close()
+			}
+
+			// Handle mask file if present
+			if maskFiles, exists := mf.File["mask"]; exists && len(maskFiles) > 0 {
+				maskFile, err := maskFiles[0].Open()
+				if err != nil {
+					return nil, errors.New("failed to open mask file")
+				}
+				// 复制完立即关闭，避免在循环内使用 defer 占用资源
+
+				// Determine MIME type for mask file
+				mimeType := detectImageMimeType(maskFiles[0].Filename)
+
+				// Create a form file with the appropriate content type
+				h := make(textproto.MIMEHeader)
+				h.Set("Content-Disposition", fmt.Sprintf(`form-data; name="mask"; filename="%s"`, maskFiles[0].Filename))
+				h.Set("Content-Type", mimeType)
+
+				maskPart, err := writer.CreatePart(h)
+				if err != nil {
+					return nil, errors.New("create form file failed for mask")
+				}
+
+				if _, err := io.Copy(maskPart, maskFile); err != nil {
+					return nil, errors.New("copy mask file failed")
+				}
+				_ = maskFile.Close()
+			}
+		} else {
+			return nil, errors.New("no multipart form data found")
+		}
+
+		// 关闭 multipart 编写器以设置分界线
+		writer.Close()
+		c.Request.Header.Set("Content-Type", writer.FormDataContentType())
+		return &requestBody, nil
+
+	default:
+		return request, nil
+	}
+}
+
+func normalizeGaiscImageRequest(request dto.ImageRequest) (dto.ImageRequest, error) {
+	request = dto.CanonicalizeGptImage2SizeAliases(request)
+
+	if len(request.Images) == 0 {
+		for _, key := range []string{"image_urls", "image_url", "urls"} {
+			raw := request.Extra[key]
+			if len(raw) == 0 {
+				continue
+			}
+			references, err := parseGaiscImageReferences(raw)
+			if err != nil {
+				return request, fmt.Errorf("invalid %s: %w", key, err)
+			}
+			request.Images = references
+			break
+		}
+	}
+	if len(request.Images) == 0 && len(request.Image) > 0 {
+		references, err := parseGaiscImageReferences(request.Image)
+		if err == nil {
+			request.Images = references
+			request.Image = nil
+		}
+	}
+	if request.Mask == nil {
+		if raw := request.Extra["mask_url"]; len(raw) > 0 {
+			references, err := parseGaiscImageReferences(raw)
+			if err != nil {
+				return request, fmt.Errorf("invalid mask_url: %w", err)
+			}
+			if len(references) != 1 {
+				return request, errors.New("mask_url must contain exactly one image URL")
+			}
+			request.Mask = &references[0]
+		}
+	}
+
+	if strings.TrimSpace(request.ResponseFormat) == "" {
+		request.ResponseFormat = "url"
+	}
+	if err := validateGaiscImageOptions(request); err != nil {
+		return request, err
+	}
+	return request, nil
+}
+
+func validateGaiscImageOptions(request dto.ImageRequest) error {
+	if strings.TrimSpace(request.Prompt) == "" {
+		return errors.New("gpt-image-2 prompt is required")
+	}
+	if request.N != nil && (*request.N < 1 || *request.N > 10) {
+		return errors.New("gpt-image-2 n must be between 1 and 10")
+	}
+	if err := validateOptionalString("quality", request.Quality, "auto", "low", "medium", "high"); err != nil {
+		return err
+	}
+	if err := validateOptionalString("response_format", request.ResponseFormat, "url", "b64_json"); err != nil {
+		return err
+	}
+	background, hasBackground, err := rawOptionalString("background", request.Background)
+	if err != nil {
+		return err
+	}
+	if hasBackground {
+		if err := validateOptionalString("background", background, "auto", "transparent", "opaque"); err != nil {
+			return err
+		}
+	}
+	outputFormat, hasOutputFormat, err := rawOptionalString("output_format", request.OutputFormat)
+	if err != nil {
+		return err
+	}
+	if hasOutputFormat {
+		if err := validateOptionalString("output_format", outputFormat, "png", "jpeg", "webp"); err != nil {
+			return err
+		}
+	}
+	if hasBackground && background == "transparent" && hasOutputFormat && outputFormat == "jpeg" {
+		return errors.New("gpt-image-2 transparent background requires output_format png or webp")
+	}
+	if err := validateRawString("moderation", request.Moderation, "auto", "low"); err != nil {
+		return err
+	}
+	if err := validateRawIntegerRange("output_compression", request.OutputCompression, 0, 100); err != nil {
+		return err
+	}
+	if len(request.OutputCompression) > 0 && (!hasOutputFormat || outputFormat == "png") {
+		return errors.New("gpt-image-2 output_compression requires output_format jpeg or webp")
+	}
+	partialImages, hasPartialImages, err := rawOptionalInteger("partial_images", request.PartialImages)
+	if err != nil {
+		return err
+	}
+	if hasPartialImages && (partialImages < 0 || partialImages > 3) {
+		return errors.New("gpt-image-2 partial_images must be between 0 and 3")
+	}
+	stream, hasStream, err := rawOptionalBoolean("stream", request.Extra["stream"])
+	if err != nil {
+		return err
+	}
+	if hasPartialImages && partialImages > 0 && (!hasStream || !stream) {
+		return errors.New("gpt-image-2 partial_images greater than 0 requires stream=true")
+	}
+	if len(request.User) > 0 {
+		var user string
+		if err := common.Unmarshal(request.User, &user); err != nil {
+			return errors.New("gpt-image-2 user must be a string")
+		}
+	}
+	inputFidelity, hasInputFidelity, err := rawOptionalString("input_fidelity", request.Extra["input_fidelity"])
+	if err != nil {
+		return err
+	}
+	if hasInputFidelity && inputFidelity != "high" {
+		return errors.New("gpt-image-2 input_fidelity must be high")
+	}
+	if hasInputFidelity && len(request.Images) == 0 {
+		return errors.New("gpt-image-2 input_fidelity requires at least one image")
+	}
+	if len(request.Images) > 16 {
+		return errors.New("gpt-image-2 images must not exceed 16")
+	}
+	for index, reference := range request.Images {
+		if err := reference.Validate(); err != nil {
+			return fmt.Errorf("gpt-image-2 images[%d]: %w", index, err)
+		}
+	}
+	if request.Mask != nil && len(request.Images) == 0 {
+		return errors.New("gpt-image-2 mask requires at least one image")
+	}
+	if request.Mask != nil {
+		if err := request.Mask.Validate(); err != nil {
+			return fmt.Errorf("gpt-image-2 mask: %w", err)
+		}
+	}
+	return nil
+}
+
+func validateOptionalString(field, value string, allowed ...string) error {
+	value = strings.ToLower(strings.TrimSpace(value))
+	if value == "" {
+		return nil
+	}
+	for _, candidate := range allowed {
+		if value == candidate {
+			return nil
+		}
+	}
+	return fmt.Errorf("gpt-image-2 %s must be one of %s", field, strings.Join(allowed, ", "))
+}
+
+func validateRawString(field string, raw json.RawMessage, allowed ...string) error {
+	value, ok, err := rawOptionalString(field, raw)
+	if err != nil || !ok {
+		return err
+	}
+	return validateOptionalString(field, value, allowed...)
+}
+
+func rawOptionalString(field string, raw json.RawMessage) (string, bool, error) {
+	if len(raw) == 0 {
+		return "", false, nil
+	}
+	var value string
+	if err := common.Unmarshal(raw, &value); err != nil {
+		return "", false, fmt.Errorf("gpt-image-2 %s must be a string", field)
+	}
+	return strings.ToLower(strings.TrimSpace(value)), true, nil
+}
+
+func validateRawIntegerRange(field string, raw json.RawMessage, minValue, maxValue int) error {
+	value, ok, err := rawOptionalInteger(field, raw)
+	if err != nil || !ok {
+		return err
+	}
+	if value < minValue || value > maxValue {
+		return fmt.Errorf("gpt-image-2 %s must be between %d and %d", field, minValue, maxValue)
+	}
+	return nil
+}
+
+func rawOptionalInteger(field string, raw json.RawMessage) (int, bool, error) {
+	if len(raw) == 0 {
+		return 0, false, nil
+	}
+	var value int
+	if err := common.Unmarshal(raw, &value); err != nil {
+		return 0, false, fmt.Errorf("gpt-image-2 %s must be an integer", field)
+	}
+	return value, true, nil
+}
+
+func rawOptionalBoolean(field string, raw json.RawMessage) (bool, bool, error) {
+	if len(raw) == 0 {
+		return false, false, nil
+	}
+	var value bool
+	if err := common.Unmarshal(raw, &value); err != nil {
+		return false, false, fmt.Errorf("gpt-image-2 %s must be a boolean", field)
+	}
+	return value, true, nil
+}
+
+func stripGaiscImageTransportAliases(request dto.ImageRequest) (dto.ImageRequest, error) {
+	for _, key := range []string{
+		"aspect_ratio", "aspectRatio",
+		"resolution", "imageSize", "image_size",
+		"image_urls", "image_url", "urls", "mask_url",
+	} {
+		delete(request.Extra, key)
+	}
+	if raw := request.Extra["metadata"]; len(raw) > 0 {
+		var metadata map[string]json.RawMessage
+		if err := common.Unmarshal(raw, &metadata); err != nil {
+			return request, fmt.Errorf("invalid metadata: %w", err)
+		}
+		for _, key := range []string{"aspect_ratio", "aspectRatio", "resolution", "imageSize", "image_size"} {
+			delete(metadata, key)
+		}
+		if len(metadata) == 0 {
+			delete(request.Extra, "metadata")
+		} else {
+			encoded, err := common.Marshal(metadata)
+			if err != nil {
+				return request, fmt.Errorf("encode metadata: %w", err)
+			}
+			request.Extra["metadata"] = encoded
+		}
+	}
+	return request, nil
+}
+
+func parseGaiscImageReferences(raw json.RawMessage) ([]dto.ImageURLReference, error) {
+	var references []dto.ImageURLReference
+	if err := common.Unmarshal(raw, &references); err == nil {
+		if len(references) == 0 {
+			return nil, errors.New("at least one image URL is required")
+		}
+		return references, nil
+	}
+
+	var reference dto.ImageURLReference
+	if err := common.Unmarshal(raw, &reference); err != nil {
+		return nil, err
+	}
+	return []dto.ImageURLReference{reference}, nil
+}
+
+// detectImageMimeType determines the MIME type based on the file extension
+func detectImageMimeType(filename string) string {
+	ext := strings.ToLower(filepath.Ext(filename))
+	switch ext {
+	case ".jpg", ".jpeg":
+		return "image/jpeg"
+	case ".png":
+		return "image/png"
+	case ".webp":
+		return "image/webp"
+	default:
+		// Try to detect from extension if possible
+		if strings.HasPrefix(ext, ".jp") {
+			return "image/jpeg"
+		}
+		// Default to png as a fallback
+		return "image/png"
+	}
+}
+
+func (a *Adaptor) ConvertOpenAIResponsesRequest(c *gin.Context, info *relaycommon.RelayInfo, request dto.OpenAIResponsesRequest) (any, error) {
+	//  转换模型推理力度后缀
+	effort, originModel := parseReasoningEffortFromModelSuffix(request.Model)
+	if effort != "" {
+		if request.Reasoning == nil {
+			request.Reasoning = &dto.Reasoning{
+				Effort: effort,
+			}
+		} else {
+			request.Reasoning.Effort = effort
+		}
+		request.Model = originModel
+	}
+	if info != nil && request.Reasoning != nil && request.Reasoning.Effort != "" {
+		info.ReasoningEffort = request.Reasoning.Effort
+	}
+	return request, nil
+}
+
+func (a *Adaptor) DoRequest(c *gin.Context, info *relaycommon.RelayInfo, requestBody io.Reader) (any, error) {
+	if info.RelayMode == relayconstant.RelayModeAudioTranscription ||
+		info.RelayMode == relayconstant.RelayModeAudioTranslation ||
+		(info.RelayMode == relayconstant.RelayModeImagesEdits &&
+			strings.Contains(c.Request.Header.Get("Content-Type"), "multipart/form-data")) {
+		return channel.DoFormRequest(a, c, info, requestBody)
+	} else if info.RelayMode == relayconstant.RelayModeRealtime {
+		return channel.DoWssRequest(a, c, info, requestBody)
+	} else {
+		return channel.DoApiRequest(a, c, info, requestBody)
+	}
+}
+
+func (a *Adaptor) DoResponse(c *gin.Context, resp *http.Response, info *relaycommon.RelayInfo) (usage any, err *types.NewAPIError) {
+	if isFlow2APIProtocol(info) && info.RelayMode == relayconstant.RelayModeImagesGenerations {
+		return flow2APIImageHandler(c, info, resp)
+	}
+	switch info.RelayMode {
+	case relayconstant.RelayModeRealtime:
+		err, usage = OpenaiRealtimeHandler(c, info)
+	case relayconstant.RelayModeAudioSpeech:
+		usage = OpenaiTTSHandler(c, resp, info)
+	case relayconstant.RelayModeAudioTranslation:
+		fallthrough
+	case relayconstant.RelayModeAudioTranscription:
+		err, usage = OpenaiSTTHandler(c, resp, info, a.ResponseFormat)
+	case relayconstant.RelayModeImagesGenerations, relayconstant.RelayModeImagesEdits:
+		usage, err = OpenaiHandlerWithUsage(c, info, resp)
+	case relayconstant.RelayModeRerank:
+		usage, err = common_handler.RerankHandler(c, info, resp)
+	case relayconstant.RelayModeResponses:
+		if c.GetBool("responses_force_stream_aggregate") {
+			// Client asked for a non-stream response but we forced the upstream to
+			// stream (reasoning models drop the message in non-stream bodies);
+			// aggregate the SSE back into a single JSON response.
+			usage, err = OaiResponsesAggregateStreamHandler(c, info, resp)
+		} else if info.IsStream {
+			usage, err = OaiResponsesStreamHandler(c, info, resp)
+		} else {
+			usage, err = OaiResponsesHandler(c, info, resp)
+		}
+	case relayconstant.RelayModeResponsesCompact:
+		usage, err = OaiResponsesCompactionHandler(c, resp)
+	default:
+		if info.IsStream {
+			usage, err = OaiStreamHandler(c, info, resp)
+		} else {
+			usage, err = OpenaiHandler(c, info, resp)
+		}
+	}
+	return
+}
+
+func (a *Adaptor) GetModelList() []string {
+	switch a.ChannelType {
+	case constant.ChannelType360:
+		return ai360.ModelList
+	case constant.ChannelTypeLingYiWanWu:
+		return lingyiwanwu.ModelList
+	//case constant.ChannelTypeMiniMax:
+	//	return minimax.ModelList
+	case constant.ChannelTypeXinference:
+		return xinference.ModelList
+	case constant.ChannelTypeOpenRouter:
+		return openrouter.ModelList
+	default:
+		return ModelList
+	}
+}
+
+func (a *Adaptor) GetChannelName() string {
+	switch a.ChannelType {
+	case constant.ChannelType360:
+		return ai360.ChannelName
+	case constant.ChannelTypeLingYiWanWu:
+		return lingyiwanwu.ChannelName
+	//case constant.ChannelTypeMiniMax:
+	//	return minimax.ChannelName
+	case constant.ChannelTypeXinference:
+		return xinference.ChannelName
+	case constant.ChannelTypeOpenRouter:
+		return openrouter.ChannelName
+	default:
+		return ChannelName
+	}
+}
