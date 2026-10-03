@@ -4,6 +4,7 @@ import { secureHeaders } from "hono/secure-headers";
 import { honoErrorHandler } from "./middleware/error";
 import { httpDebugLoggerMiddleware } from "./middleware/httpDebugLogger";
 import { requestTraceMiddleware } from "./middleware/requestTrace";
+import { healthCheckMiddleware } from "./middleware/health-check";
 import { authRouter } from "./modules/auth/auth.routes";
 import { projectRouter } from "./modules/project/project.routes";
 import { communityRouter } from "./modules/community/community.routes";
@@ -110,6 +111,9 @@ export async function createTapCanvasApp(): Promise<OpenAPIHono<AppEnv>> {
 
 	// Global HTTP debug logger (local-only; enable via DEBUG_HTTP_LOG=1)
 	app.use("*", httpDebugLoggerMiddleware);
+
+	// Health check middleware for New API degradation detection
+	app.use("*", healthCheckMiddleware());
 
 	app.use("*", secureHeaders({
 		crossOriginResourcePolicy: "cross-origin",
