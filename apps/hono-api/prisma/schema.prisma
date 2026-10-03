@@ -1285,6 +1285,21 @@ model auth_sessions {
   @@index([expires_at], map: "idx_auth_sessions_expires")
 }
 
+model sessions {
+  id               String @id
+  user_id          String
+  username         String?
+  email            String?
+  avatar_url       String?
+  token            String @unique(map: "idx_sessions_token")
+  expires_at       String
+  created_at       String
+  last_accessed_at String
+
+  @@index([user_id], map: "idx_sessions_user_id")
+  @@index([expires_at], map: "idx_sessions_expires_at")
+}
+
 model user_notifications {
   id            String  @id
   user_id       String
