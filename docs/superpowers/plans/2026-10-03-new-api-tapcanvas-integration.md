@@ -2619,6 +2619,118 @@ git commit -m "docs: add API reference documentation"
 
 ---
 
+## Part 11: Repository Setup
+
+### Task 0: Create GitHub Repository and Initial Setup
+
+**Files:**
+- Modify: `.gitignore`, `README.md`
+
+**Interfaces:**
+- Consumes: GitHub account credentials
+- Produces: Remote repository `api-canvas` on GitHub, initial project structure
+
+- [ ] **Step 1: Create GitHub repository**
+
+Run: `gh repo create api-canvas --public --description "New API + TapCanvas Integration: SSO, Wallet, AI Model Gateway"`
+
+Or create manually at https://github.com/new with:
+- Repository name: `api-canvas`
+- Description: "New API + TapCanvas Integration: SSO, Wallet, AI Model Gateway"
+- Visibility: Public (or Private based on your preference)
+- Initialize: Do NOT initialize with README (we already have commits)
+
+- [ ] **Step 2: Create .gitignore file**
+
+```bash
+# .gitignore
+# Environment variables
+.env
+.env.local
+.env.production
+
+# Dependencies
+node_modules/
+vendor/
+
+# Build outputs
+dist/
+build/
+*.exe
+
+# Database
+*.db
+*.sqlite
+*.sqlite3
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+logs/
+
+# Test coverage
+coverage/
+*.coverprofile
+
+# Temporary files
+tmp/
+temp/
+```
+
+- [ ] **Step 3: Create README.md**
+
+```markdown
+# API Canvas Integration
+
+New API + TapCanvas 轻量级集成方案，实现 SSO 单点登录、共享钱包、AI 模型网关。
+
+## 项目结构
+
+- `apps/new-api/` - AI 模型网关（Go）
+- `apps/tapcanvas/` - Canvas 视频创作平台（TypeScript）
+- `docs/` - 设计文档和实施计划
+- `tests/` - 集成测试
+
+## 快速开始
+
+详见 [设计文档](docs/superpowers/specs/2026-10-03-new-api-tapcanvas-integration-design.md) 和 [实施计划](docs/superpowers/plans/2026-10-03-new-api-tapcanvas-integration.md)。
+
+## 技术栈
+
+- **New API**: Go 1.19+, Gin, GORM, PostgreSQL/MySQL/SQLite
+- **TapCanvas**: Node.js 18+, TypeScript, Hono, Prisma, PostgreSQL
+
+## License
+
+MIT
+```
+
+- [ ] **Step 4: Add remote and push**
+
+```bash
+cd E:\ZSXQ\API_Canvas
+git add .gitignore README.md
+git commit -m "chore: add .gitignore and README"
+git remote add origin https://github.com/YOUR_USERNAME/api-canvas.git
+git branch -M main
+git push -u origin main
+```
+
+- [ ] **Step 5: Verify repository is accessible**
+
+Visit: `https://github.com/YOUR_USERNAME/api-canvas`
+
+---
+
 ## Final Verification
 
 ### Task 21: Acceptance Testing Checklist
@@ -2666,4 +2778,8 @@ Plan complete and saved to `E:\ZSXQ\API_Canvas\docs\superpowers\plans\2026-10-03
 - **Subagent-driven** - A fresh subagent implements each task and a fresh reviewer checks it before the next one starts, then a whole-branch review at the end. Most thorough; costs a fresh context per task and per review.
 - **Native** - I implement every task myself in this session, the way this harness runs work, then one fresh reviewer on the most capable model checks the whole branch. Cheapest and fastest; no independent review until the end.
 
-**For this plan I recommend Subagent-driven, because the tasks span two independent codebases (New API in Go, TapCanvas in TypeScript), involve database migrations that must execute in sequence, and a mistake in the wallet credit flow could cause financial loss. Independent review per task catches integration errors early.** Does the plan capture what you want, and which approach should we use?
+**For this plan I recommend Subagent-driven, because the tasks span two independent codebases (New API in Go, TapCanvas in TypeScript), involve database migrations that must execute in sequence, and a mistake in the wallet credit flow could cause financial loss. Independent review per task catches integration errors early.** 
+
+**Note: Task 0 (GitHub repository setup) should be completed first before starting the main implementation tasks.**
+
+Does the plan capture what you want, and which approach should we use?
