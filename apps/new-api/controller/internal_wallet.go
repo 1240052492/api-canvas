@@ -60,6 +60,18 @@ type PreDeductResponse struct {
 	BalanceAfter int64  `json:"balance_after"`
 }
 
+type SettleRequest struct {
+	DeductionId    string `json:"deduction_id" binding:"required"`
+	ActualCost     int64  `json:"actual_cost" binding:"required"`
+	IdempotencyKey string `json:"idempotency_key" binding:"required"`
+}
+
+type SettleResponse struct {
+	Settled        bool  `json:"settled"`
+	RefundedAmount int64 `json:"refunded_amount"`
+	BalanceAfter   int64 `json:"balance_after"`
+}
+
 func generateSecureRandomId() string {
 	b := make([]byte, 8)
 	_, err := rand.Read(b)
@@ -177,5 +189,74 @@ func PreDeductCredits(c *gin.Context) {
 		DeductionId:  deductionId,
 		Amount:       req.Amount,
 		BalanceAfter: balanceAfter,
+	})
+}
+
+func SettleCredits(c *gin.Context) {
+	var req SettleRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid_request"})
+		return
+	}
+
+	// Check idempotency
+	existing, _ := model.GetTransactionByIdempotencyKey(req.IdempotencyKey)
+	if existing != nil {
+		// Already settled, return success
+		c.JSON(http.StatusOK, SettleResponse{Settled: true})
+		return
+	}
+
+	// Get pre-deduct transaction
+	var preDeduct model.WalletTransaction
+	if err := model.DB.Where("id = ? AND type = ?", req.DeductionId, "pre_deduct").First(&preDeduct).Error; err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "deduction_not_found"})
+		return
+	}
+
+	refundAmount := preDeduct.Amount - req.ActualCost
+	var balanceAfter int64
+
+	err := model.DB.Transaction(func(tx *gorm.DB) error {
+		var user model.User
+		if err := tx.Where("id = ?", preDeduct.UserId).First(&user).Error; err != nil {
+			return err
+		}
+
+		// Refund difference: decrease used_quota by refundAmount
+		if refundAmount > 0 {
+			if err := tx.Model(&user).Update("used_quota", gorm.Expr("used_quota - ?", refundAmount)).Error; err != nil {
+				return err
+			}
+		}
+
+		balanceAfter = int64(user.Quota) - int64(user.UsedQuota) + refundAmount
+
+		// Record settle transaction
+		settleTx := &model.WalletTransaction{
+			Id:             "settle_" + hex.EncodeToString(make([]byte, 8)),
+			UserId:         preDeduct.UserId,
+			Type:           "settle",
+			Amount:         req.ActualCost,
+			IdempotencyKey: req.IdempotencyKey,
+			DeductionId:    req.DeductionId,
+		}
+		// Generate proper random ID
+		b := make([]byte, 8)
+		rand.Read(b)
+		settleTx.Id = "settle_" + hex.EncodeToString(b)
+
+		return tx.Create(settleTx).Error
+	})
+
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	c.JSON(http.StatusOK, SettleResponse{
+		Settled:        true,
+		RefundedAmount: refundAmount,
+		BalanceAfter:   balanceAfter,
 	})
 }
