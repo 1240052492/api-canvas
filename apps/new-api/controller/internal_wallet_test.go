@@ -61,8 +61,30 @@ func setupTestRouterWithServiceAuth() *gin.Engine {
 	// Set up the internal v1 group with service token auth
 	internal := router.Group("/internal/v1")
 	internal.POST("/wallet/pre-deduct", PreDeductCredits)
+	internal.POST("/wallet/settle", SettleCredits)
 
 	return router
+}
+
+func preDeductForTest(userId int, amount int64, taskId string) string {
+	idempotencyKey := strconv.Itoa(userId) + "_task_" + taskId + "_prededuct"
+
+	router := setupTestRouterWithServiceAuth()
+	body := `{
+        "user_id": ` + strconv.Itoa(userId) + `,
+        "amount": ` + strconv.FormatInt(amount, 10) + `,
+        "idempotency_key": "` + idempotencyKey + `",
+        "metadata": {"task_id": "` + taskId + `"}
+    }`
+	req := httptest.NewRequest("POST", "/internal/v1/wallet/pre-deduct", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+testServiceToken)
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	var resp map[string]interface{}
+	json.Unmarshal(w.Body.Bytes(), &resp)
+	return resp["deduction_id"].(string)
 }
 
 func createTestUserWithQuota(quota int) *model.User {
@@ -144,6 +166,72 @@ func TestPreDeductIdempotency(t *testing.T) {
 
 	updatedUser, _ := model.GetUserById(user.Id, false)
 	assert.Equal(t, int64(10000), int64(updatedUser.UsedQuota)) // Only deducted once
+}
+
+func TestSettleCredits(t *testing.T) {
+	setupInternalWalletTestDB(t)
+	user := createTestUserWithQuota(2000000)
+
+	// Pre-deduct 10000
+	deductionId := preDeductForTest(user.Id, 10000, "settle_test")
+
+	router := setupTestRouterWithServiceAuth()
+	body := `{
+        "deduction_id": "` + deductionId + `",
+        "actual_cost": 8500,
+        "idempotency_key": "` + strconv.Itoa(user.Id) + `_task_settle_test_settle"
+    }`
+	req := httptest.NewRequest("POST", "/internal/v1/wallet/settle", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+testServiceToken)
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	assert.Equal(t, 200, w.Code)
+	var resp map[string]interface{}
+	json.Unmarshal(w.Body.Bytes(), &resp)
+	assert.True(t, resp["settled"].(bool))
+	assert.Equal(t, float64(1500), resp["refunded_amount"]) // 10000 - 8500
+	assert.Equal(t, float64(1991500), resp["balance_after"]) // 2000000 - 8500
+
+	// Verify final used_quota is actual_cost
+	user, _ = model.GetUserById(user.Id, false)
+	assert.Equal(t, int64(8500), int64(user.UsedQuota))
+}
+
+func TestSettleIdempotency(t *testing.T) {
+	setupInternalWalletTestDB(t)
+	user := createTestUserWithQuota(2000000)
+	deductionId := preDeductForTest(user.Id, 10000, "settle_idem")
+	idempotencyKey := strconv.Itoa(user.Id) + "_task_settle_idem_settle"
+
+	body := `{
+        "deduction_id": "` + deductionId + `",
+        "actual_cost": 8500,
+        "idempotency_key": "` + idempotencyKey + `"
+    }`
+
+	router := setupTestRouterWithServiceAuth()
+
+	// First settle
+	req1 := httptest.NewRequest("POST", "/internal/v1/wallet/settle", strings.NewReader(body))
+	req1.Header.Set("Content-Type", "application/json")
+	req1.Header.Set("Authorization", "Bearer "+testServiceToken)
+	w1 := httptest.NewRecorder()
+	router.ServeHTTP(w1, req1)
+	assert.Equal(t, 200, w1.Code)
+
+	// Second settle with same key
+	req2 := httptest.NewRequest("POST", "/internal/v1/wallet/settle", strings.NewReader(body))
+	req2.Header.Set("Content-Type", "application/json")
+	req2.Header.Set("Authorization", "Bearer "+testServiceToken)
+	w2 := httptest.NewRecorder()
+	router.ServeHTTP(w2, req2)
+	assert.Equal(t, 200, w2.Code)
+
+	// Verify only settled once
+	user, _ = model.GetUserById(user.Id, false)
+	assert.Equal(t, int64(8500), int64(user.UsedQuota))
 }
 
 func TestPreDeductInsufficientBalance(t *testing.T) {

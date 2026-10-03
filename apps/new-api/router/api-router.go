@@ -402,6 +402,7 @@ func SetApiRouter(router *gin.Engine) {
 			walletRoute := internal.Group("/wallet")
 			{
 				walletRoute.POST("/pre-deduct", controller.PreDeductCredits)
+				walletRoute.POST("/settle", controller.SettleCredits)
 			}
 		}
 	}
