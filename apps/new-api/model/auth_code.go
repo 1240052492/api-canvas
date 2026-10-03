@@ -28,7 +28,7 @@ func GenerateAuthCode(userId int, redirectUri, state string) (*AuthCode, error) 
 	if _, err := rand.Read(bytes); err != nil {
 		return nil, err
 	}
-	code := base64.URLEncoding.EncodeToString(bytes)
+	code := base64.RawURLEncoding.EncodeToString(bytes)
 
 	authCode := &AuthCode{
 		Code:        code,

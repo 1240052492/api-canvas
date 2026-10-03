@@ -31,8 +31,8 @@ func TestGenerateAuthCodeFormat(t *testing.T) {
 	// Verify code format: 24 bytes encoded to base64url = 32 characters
 	assert.Equal(t, 32, len(authCode.Code), "Auth code should be exactly 32 characters")
 
-	// Verify it's valid base64url
-	decoded, err := base64.URLEncoding.DecodeString(authCode.Code)
+	// Verify it's valid base64url (raw, no padding)
+	decoded, err := base64.RawURLEncoding.DecodeString(authCode.Code)
 	assert.NoError(t, err, "Auth code should be valid base64url")
 	assert.Equal(t, 24, len(decoded), "Decoded auth code should be exactly 24 bytes")
 
