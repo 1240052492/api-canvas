@@ -45,6 +45,8 @@ func SetApiRouter(router *gin.Engine) {
 		apiRouter.GET("/internal/usage", middleware.InternalTokenAuth(), controller.GetInternalUsage)
 		// Internal: aggregate gateway setup facts for the TapCanvas first-run gate.
 		apiRouter.GET("/internal/readiness", middleware.InternalTokenAuth(), controller.GetGatewayReadiness)
+		// Service: TapCanvas balance query (requires service token)
+		apiRouter.POST("/service/balance", middleware.ServiceTokenAuth(), controller.QueryUserBalance)
 		apiRouter.GET("/verification", middleware.EmailVerificationRateLimit(), middleware.TurnstileCheck(), controller.SendEmailVerification)
 		apiRouter.GET("/captcha", middleware.CriticalRateLimit(), controller.GetCaptcha)
 		apiRouter.GET("/reset_password", middleware.CriticalRateLimit(), middleware.TurnstileCheck(), controller.SendPasswordResetEmail)
