@@ -5042,6 +5042,26 @@ export async function verifyEmailLogin(email: string, code: string): Promise<Aut
   return body as AuthResponseDto
 }
 
+// ---- Wallet Balance ----------------------------------------------------------
+
+export type WalletBalanceDto = {
+  user_id: string
+  balance: number
+  used_quota: number
+  display_balance: string
+}
+
+export async function getWalletBalance(): Promise<WalletBalanceDto> {
+  const r = await apiFetch(`${API_BASE}/api/user/wallet`, {
+    method: 'GET',
+    credentials: 'include',
+  })
+  if (!r.ok) {
+    throw new Error(`Failed to fetch wallet balance: ${r.status}`)
+  }
+  return r.json()
+}
+
 // ---- 公众号扫码登录 ----------------------------------------------------------
 
 export type WechatLoginSessionDto = {

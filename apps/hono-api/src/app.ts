@@ -389,6 +389,10 @@ export async function createTapCanvasApp(): Promise<OpenAPIHono<AppEnv>> {
 	// User management (admin only)
 	app.route("/admin/users", userAdminRouter);
 
+	// User wallet routes
+	const { walletRouter } = await import("./modules/user/wallet.routes");
+	app.route("/api/user/wallet", walletRouter);
+
 	// Project management (admin only)
 	app.route("/admin/projects", projectAdminRouter);
 	app.route("/admin/prompt-library", promptLibraryAdminRouter);

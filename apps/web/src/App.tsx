@@ -87,6 +87,7 @@ import AgentAdminWorkbenchPanel from './ui/AgentAdminWorkbenchPanel'
 import { useAgentCanvasDeepLink } from './ui/agent-task-execution/useAgentCanvasDeepLink'
 import { StudioProjectNameEditor } from './ui/StudioProjectNameEditor'
 import { PortalAccountMenu } from './portal/PortalAccountMenu'
+import { WalletBalance } from './ui/WalletBalance'
 import { compileAgentWorkflow } from './canvas/agentWorkflowExecution'
 import { compileVideoWorkflow } from './canvas/videoWorkflowExecution'
 import { AGENT_WORKFLOW_KEY } from '@tapcanvas/workflow-kernel-protocol'
@@ -1744,6 +1745,7 @@ function CanvasApp({
 					>
 						{headerPointsLoading ? '…' : String(Math.max(0, Number(headerTeam?.creditsAvailable || 0)))}
 					</Badge>
+					<WalletBalance />
                 </>
               ) : null}
               <Tooltip label="章节画布" withArrow>
