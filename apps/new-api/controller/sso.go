@@ -1,6 +1,7 @@
 package controller
 
 import (
+	"fmt"
 	"net/http"
 	"net/url"
 	"strings"
@@ -68,7 +69,7 @@ type SSOTokenRequest struct {
 }
 
 type SSOTokenResponse struct {
-	UserId    int    `json:"user_id"`
+	UserId    string `json:"user_id"`
 	Username  string `json:"username"`
 	Email     string `json:"email"`
 	AvatarUrl string `json:"avatar_url"`
@@ -95,7 +96,7 @@ func SSOTokenExchange(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, SSOTokenResponse{
-		UserId:    user.Id,
+		UserId:    fmt.Sprintf("%d", user.Id),
 		Username:  user.Username,
 		Email:     user.Email,
 		AvatarUrl: "",

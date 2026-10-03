@@ -4,6 +4,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -172,7 +173,7 @@ func TestSSOTokenExchangeSuccess(t *testing.T) {
 	assert.Equal(t, http.StatusOK, w.Code)
 	var resp map[string]interface{}
 	common.Unmarshal(w.Body.Bytes(), &resp)
-	assert.Equal(t, float64(testUser.Id), resp["user_id"])
+	assert.Equal(t, strconv.Itoa(testUser.Id), resp["user_id"])
 	assert.Equal(t, "testuser", resp["username"])
 	assert.Equal(t, "test@example.com", resp["email"])
 	assert.Equal(t, float64(2592000), resp["expires_in"])

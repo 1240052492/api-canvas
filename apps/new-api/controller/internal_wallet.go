@@ -5,6 +5,7 @@ import (
 	"errors"
 	"math/rand"
 	"net/http"
+	"strconv"
 	"strings"
 
 	"github.com/QuantumNous/new-api/model"
@@ -13,7 +14,7 @@ import (
 )
 
 type PreDeductRequest struct {
-	UserId         int               `json:"user_id" binding:"required"`
+	UserId         string            `json:"user_id" binding:"required"`
 	Amount         int64             `json:"amount" binding:"required"`
 	IdempotencyKey string            `json:"idempotency_key" binding:"required"`
 	Metadata       map[string]string `json:"metadata"`
@@ -53,6 +54,13 @@ func PreDeductCredits(c *gin.Context) {
 		return
 	}
 
+	// Parse user_id string to int for database query
+	userId, err := strconv.Atoi(req.UserId)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid_user_id"})
+		return
+	}
+
 	// Check idempotency
 	existing, err := model.GetTransactionByIdempotencyKey(req.IdempotencyKey)
 	if err != nil {
@@ -61,7 +69,7 @@ func PreDeductCredits(c *gin.Context) {
 	}
 	if existing != nil {
 		// Return existing result
-		user, err := model.GetUserById(req.UserId, false)
+		user, err := model.GetUserById(existing.UserId, false)
 		if err != nil || user == nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "user_not_found"})
 			return
@@ -81,7 +89,7 @@ func PreDeductCredits(c *gin.Context) {
 
 	err = model.DB.Transaction(func(tx *gorm.DB) error {
 		var user model.User
-		if err := tx.Where("id = ?", req.UserId).First(&user).Error; err != nil {
+		if err := tx.Where("id = ?", userId).First(&user).Error; err != nil {
 			return err
 		}
 
@@ -101,7 +109,7 @@ func PreDeductCredits(c *gin.Context) {
 		metadataJSON, _ := json.Marshal(req.Metadata)
 		walletTx := &model.WalletTransaction{
 			Id:             deductionId,
-			UserId:         req.UserId,
+			UserId:         userId,
 			Type:           "pre_deduct",
 			Amount:         req.Amount,
 			IdempotencyKey: req.IdempotencyKey,

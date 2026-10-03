@@ -72,7 +72,7 @@ func preDeductForTest(userId int, amount int64, taskId string) string {
 
 	router := setupTestRouterWithServiceAuth()
 	body := `{
-        "user_id": ` + strconv.Itoa(userId) + `,
+        "user_id": "` + strconv.Itoa(userId) + `",
         "amount": ` + strconv.FormatInt(amount, 10) + `,
         "idempotency_key": "` + idempotencyKey + `",
         "metadata": {"task_id": "` + taskId + `"}
@@ -107,7 +107,7 @@ func TestPreDeductSuccess(t *testing.T) {
 
 	router := setupTestRouterWithServiceAuth()
 	body := `{
-        "user_id": ` + strconv.Itoa(user.Id) + `,
+        "user_id": "` + strconv.Itoa(user.Id) + `",
         "amount": 10000,
         "idempotency_key": "` + strconv.Itoa(user.Id) + `_task_abc_prededuct",
         "metadata": {"task_id": "task_abc"}
@@ -136,7 +136,7 @@ func TestPreDeductIdempotency(t *testing.T) {
 
 	router := setupTestRouterWithServiceAuth()
 	body := `{
-        "user_id": ` + strconv.Itoa(user.Id) + `,
+        "user_id": "` + strconv.Itoa(user.Id) + `",
         "amount": 10000,
         "idempotency_key": "` + idempotencyKey + `"
     }`
@@ -241,7 +241,7 @@ func TestPreDeductInsufficientBalance(t *testing.T) {
 
 	router := setupTestRouterWithServiceAuth()
 	body := `{
-        "user_id": ` + strconv.Itoa(user.Id) + `,
+        "user_id": "` + strconv.Itoa(user.Id) + `",
         "amount": 10000,
         "idempotency_key": "` + strconv.Itoa(user.Id) + `_task_fail_prededuct"
     }`
