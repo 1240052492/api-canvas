@@ -325,6 +325,10 @@ export async function createTapCanvasApp(): Promise<OpenAPIHono<AppEnv>> {
 	app.route("/account", accountRouter);
 	app.route("/admin/account", accountAdminRouter);
 
+	// OAuth routes
+	const { oauthRoutes } = await import("./modules/auth/oauth.routes");
+	app.route("/oauth", oauthRoutes);
+
 	// Public consult API (no auth — for external business Q&A)
 	registerConsultRoute(app);
 
