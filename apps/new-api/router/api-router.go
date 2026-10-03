@@ -47,6 +47,8 @@ func SetApiRouter(router *gin.Engine) {
 		apiRouter.GET("/internal/readiness", middleware.InternalTokenAuth(), controller.GetGatewayReadiness)
 		// Service: TapCanvas balance query (requires service token)
 		apiRouter.GET("/internal/v1/users/:id/wallet", middleware.ServiceTokenAuth(), controller.GetWalletBalance)
+		// Service: TapCanvas pre-deduct credits endpoint (requires service token)
+		apiRouter.POST("/internal/v1/wallet/pre-deduct", middleware.ServiceTokenAuth(), controller.PreDeductCredits)
 		apiRouter.GET("/verification", middleware.EmailVerificationRateLimit(), middleware.TurnstileCheck(), controller.SendEmailVerification)
 		apiRouter.GET("/captcha", middleware.CriticalRateLimit(), controller.GetCaptcha)
 		apiRouter.GET("/reset_password", middleware.CriticalRateLimit(), middleware.TurnstileCheck(), controller.SendPasswordResetEmail)
